@@ -7,6 +7,9 @@ Open a URL on any computer or phone, type the password, and see what you write a
 > [!WARNING]
 > **This is an experimental hobby project.** It modifies a device you rely on, runs as `root`, and makes your tablet's screen reachable from the public internet. Read [Security considerations](#security-considerations) before you use it, and use it at your own risk. It is provided **as is, without any warranty**. The author is not liable for any damage, data loss or security incident caused by using it (see [Disclaimer](#disclaimer) and [LICENSE](LICENSE)).
 
+> [!IMPORTANT]
+> **This is not a broadcasting or mass-sharing tool.** The server runs *on the tablet itself*, so its CPU, Wi-Fi and battery serve every viewer. At most **3 viewers** can watch at once, and a 4th one disconnects the others. It is meant for showing your screen to yourself or a few people, for example in a call, a tutoring session or a small meeting. See [Intended use and limitations](#intended-use-and-limitations).
+
 ---
 
 ## Contents
@@ -21,6 +24,7 @@ Open a URL on any computer or phone, type the password, and see what you write a
 - [Configuration](#configuration)
 - [Operating the services](#operating-the-services)
 - [Troubleshooting](#troubleshooting)
+- [Intended use and limitations](#intended-use-and-limitations)
 - [Security considerations](#security-considerations)
 - [Project layout](#project-layout)
 - [Development](#development)
@@ -197,6 +201,18 @@ ssh root@10.11.99.1 'sh /home/root/rmshare/install.sh'     # or simply re-run ./
 | The page says *"The tablet is asleep"* | It is. Wake the tablet up and the picture comes back by itself. |
 | Choppy picture through the tunnel | Compare it with the local `http://10.11.99.1:8080`. If local is smooth, the tunnel is the bottleneck; if local is just as choppy, the tablet's Wi-Fi or frame encoding is. |
 | Login says *"Too many failed attempts"* | 20 failed logins (from anyone) within 15 minutes lock logging in until the window passes. Restarting `rmshare-proxy` also clears the lock. |
+
+## Intended use and limitations
+
+reMarkable Live is a **personal screen-sharing tool for a handful of viewers**. It is not a streaming service. There is no server or CDN in the middle that could fan the stream out to many people: every viewer gets a separate stream straight from the tablet.
+
+- **Hard limit of 3 concurrent viewers.** The patched goMarkableStream admits at most 3 streams at once (`maxWriters` in [`gms/stream_preempt.patch`](gms/stream_preempt.patch)). A 4th viewer does not wait in a queue. It **disconnects the existing viewers** and takes over, so sharing the link widely makes the stream unusable for everyone.
+- **Every viewer costs the tablet resources.** Frames are read from xochitl's memory and delta-encoded **separately for each connection**, on the tablet's CPU, right next to the UI you are writing in. More viewers mean more CPU load, a less responsive tablet and faster battery drain. Even with a single viewer, idle refresh alone takes about 15–20 % of one CPU core.
+- **Bandwidth comes from the tablet's Wi-Fi.** Each viewer's stream is uploaded separately over the tablet's wireless connection, so total traffic grows with the number of viewers. The tunnel provider only relays it.
+- **Availability depends on the tablet.** When the tablet sleeps, loses Wi-Fi, runs out of battery or restarts xochitl, every viewer loses the picture. There is no recording, buffering or replay.
+- **No per-viewer access control.** Everyone shares one password, and anyone who has it can also draw on the tablet (see [Security considerations](#security-considerations)).
+
+If you need to present to a larger audience, share your screen to a single viewer (for example your own computer) and broadcast that computer's screen with a video-conferencing or streaming tool.
 
 ## Security considerations
 

@@ -92,6 +92,8 @@ Upstream goMarkableStream serves **one viewer at a time**: the second gets a 429
 
 `stream_preempt.patch` gives every connection its own delta encoder and admits up to **3 concurrent viewers**. A fourth viewer preempts the existing streams instead of being rejected. That matters because a tab that vanished behind a tunnel may not be noticed as disconnected for a long time.
 
+Each admitted viewer gets its own framebuffer reads and delta encoding on the tablet's CPU, and its own upload over the tablet's Wi-Fi. That is why the limit is deliberately small: this is not meant for broadcasting to many viewers (see [Intended use and limitations](../README.md#intended-use-and-limitations)).
+
 ## goMarkableStream patches
 
 The patches live in [`gms/`](../gms/) and are applied by [`gms/build-gms.sh`](../gms/build-gms.sh) in the order listed in [`gms/series`](../gms/series). They target goMarkableStream **v1.4.0**. All of them are required: without them you get plain upstream behaviour, which does not work reliably on the Paper Pro.
