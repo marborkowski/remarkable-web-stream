@@ -177,14 +177,16 @@ The component versions are pinned in [`deploy.sh`](deploy.sh). You can override 
 ssh root@10.11.99.1
 systemctl status rmshare-stream rmshare-proxy rmshare-tunnel
 journalctl -u rmshare-stream -u rmshare-proxy -u rmshare-tunnel -f
-curl -s localhost:8080/healthz                # "ok" when the proxy is up
+wget -qO- http://127.0.0.1:8080/healthz      # "ok" when the proxy is up
 sh /home/root/rmshare/uninstall.sh            # stop and remove the services
 rm -rf /home/root/rmshare                     # ...and delete all files
 ```
 
 The viewer also works locally without any tunnel, still behind the password: `http://10.11.99.1:8080` (USB) or `http://<tablet-ip>:8080` (Wi-Fi).
 
-**After a reMarkable software update.** Updates replace `/etc/systemd/system`, but `/home/root` survives. Re-install the services with:
+**Starting on boot.** On the Paper Pro, `/etc` is an overlay whose writable layer lives in RAM, so anything written to `/etc/systemd/system` disappears on reboot. `install.sh` therefore also writes the three unit files to the root partition itself. It remounts `/` read-write just for that and switches it back to read-only afterwards. `uninstall.sh` removes them again.
+
+**After a reMarkable software update.** An update switches to the other root partition, so the services are gone. The files in `/home/root` survive. Re-install the services with:
 
 ```bash
 ssh root@10.11.99.1 'sh /home/root/rmshare/install.sh'     # or simply re-run ./deploy.sh
@@ -229,6 +231,7 @@ This project puts a live view of your tablet on the internet. Please understand 
 - **Secrets are stored in plain text** in `/home/root/rmshare/tunnel.env` on the device (mode `600`). That includes the password, Tailscale auth keys and Cloudflare tokens. They are also on your computer in `tunnel.env`, which is git-ignored. Never commit it.
 - **Downloads are not checksum-verified.** `deploy.sh` downloads cloudflared, Tailscale and the goMarkableStream source over HTTPS from their official locations, but it does not verify signatures or checksums.
 - **Client IPs in the logs can be spoofed.** They come from `CF-Connecting-IP` / `X-Forwarded-For` and are used only for logging.
+- **The system partition is modified.** To start on boot, `install.sh` remounts the read-only root partition read-write and adds three systemd unit files to it (nothing else is changed). `uninstall.sh` removes them.
 - **Developer mode** and root SSH access lower the tablet's own security. That is a prerequisite of this project, not something it adds.
 
 If you find a vulnerability, please report it as described in [SECURITY.md](SECURITY.md).
@@ -250,6 +253,7 @@ device/                   files installed on the tablet
   rmshare-*.service         systemd units: stream, proxy, tunnel
   run-tunnel.sh             tunnel mode selection (Tailscale / Cloudflare) and watchdog
   install.sh, uninstall.sh  service installation and removal (run on the tablet)
+  rootfs.sh                 helpers to persist the units on the root partition
 tools/pentool/            pen diagnostics: axis ranges, event dump, test stroke
 docs/                     detailed documentation
 deploy.sh                 build + download + upload + install (run on your computer)

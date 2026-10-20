@@ -1,9 +1,11 @@
 #!/bin/sh
 # Runs ON the reMarkable (as root), from /home/root/rmshare.
 # Installs and enables three systemd services: stream, proxy, tunnel.
+# Run it again after a reMarkable OS update (the files in /home survive it).
 set -e
 DIR=/home/root/rmshare
 cd "$DIR"
+. ./rootfs.sh
 
 for f in gomarkablestream rmshare cloudflared run-tunnel.sh; do
   [ -f "$f" ] || { echo "missing file $DIR/$f"; exit 1; }
@@ -11,18 +13,28 @@ for f in gomarkablestream rmshare cloudflared run-tunnel.sh; do
 done
 [ -f tunnel.env ] && chmod 600 tunnel.env
 
-for u in rmshare-stream rmshare-proxy rmshare-tunnel; do
+# Make the services start on boot even where /etc is a RAM-backed overlay.
+if etc_is_volatile; then
+  if with_rootfs_etc persist_units; then
+    echo "Services installed on the root partition (start on boot until the next OS update)."
+  else
+    echo "WARNING: could not write to the root partition; the services will NOT start after a reboot."
+  fi
+fi
+
+# Install into the live /etc as well, so they are active right away.
+for u in $UNITS; do
   cp "$u.service" /etc/systemd/system/
 done
 systemctl daemon-reload
-for u in rmshare-stream rmshare-proxy rmshare-tunnel; do
+for u in $UNITS; do
   systemctl enable "$u.service" >/dev/null 2>&1
   systemctl restart "$u.service"
 done
 
 sleep 3
 echo
-for u in rmshare-stream rmshare-proxy rmshare-tunnel; do
+for u in $UNITS; do
   printf "%-16s %s\n" "$u" "$(systemctl is-active $u.service)"
 done
 echo

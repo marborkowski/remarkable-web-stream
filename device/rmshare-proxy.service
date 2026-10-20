@@ -1,5 +1,7 @@
 [Unit]
 Description=rmshare: password-protected proxy in front of goMarkableStream
+# The binaries live on the encrypted /home partition.
+RequiresMountsFor=/home/root/rmshare
 After=rmshare-stream.service
 Wants=rmshare-stream.service
 

@@ -1,5 +1,7 @@
 [Unit]
 Description=rmshare: goMarkableStream (reMarkable screen, localhost only)
+# The binaries live on the encrypted /home partition.
+RequiresMountsFor=/home/root/rmshare
 After=xochitl.service
 Wants=xochitl.service
 
