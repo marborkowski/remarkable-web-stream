@@ -1,0 +1,20 @@
+[Unit]
+Description=rmshare: goMarkableStream (ekran reMarkable, tylko localhost)
+After=xochitl.service
+Wants=xochitl.service
+
+[Service]
+Type=simple
+Environment=RK_SERVER_BIND_ADDR=127.0.0.1:2011
+Environment=RK_HTTPS=false
+Environment=RK_JWT_ENABLED=false
+Environment=RK_TLS_AUTO_GENERATE=false
+ExecStart=/home/root/rmshare/gomarkablestream -unsafe
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rmshare-stream
+
+[Install]
+WantedBy=multi-user.target

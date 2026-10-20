@@ -1,0 +1,140 @@
+--- a/internal/stream/handler.go
++++ b/internal/stream/handler.go
+@@ -25,6 +25,13 @@
+ 	// penLiftCooldown is the grace period after pen lift during which we continue
+ 	// streaming to flush buffered frames and catch late xochitl renders.
+ 	penLiftCooldown = 300 * time.Millisecond
++
++	// idleInterval is how often the framebuffer is still checked while
++	// nobody writes. Screen changes without pen/touch input (a document
++	// finishing to load, a rotation, a page turned by a button) would
++	// otherwise never reach the viewer. Unchanged frames cost a hash and a
++	// few-byte empty delta, which also keeps tunnels from idling out.
++	idleInterval = 500 * time.Millisecond
+ )
+ 
+ var rawFrameBuffer = sync.Pool{
+@@ -195,6 +202,8 @@
+ 				if !writing {
+ 					debug.Log("Stream: writing resumed (source=%v, pressure=%d)", event.Source, currentPressure)
+ 					asyncReader.Resume()
++					asyncReader.SetInterval(rate * time.Millisecond)
++					ticker.Reset(rate * time.Millisecond)
+ 				}
+ 				writing = true
+ 				stopWriting.Reset(2000 * time.Millisecond)
+@@ -214,28 +223,35 @@
+ 			}
+ 		case <-stopWriting.C:
+ 			if writing {
+-				debug.Log("Stream: writing paused (no input for 2s)")
+-				asyncReader.Pause()
++				debug.Log("Stream: writing idle (no input for 2s), slow refresh")
++				asyncReader.SetInterval(idleInterval)
++				ticker.Reset(idleInterval)
+ 			}
+ 			writing = false
+ 			cooldownActive = false
+ 		case <-cooldownTimer.C:
+ 			if writing && cooldownActive {
+-				debug.Log("Stream: writing paused (pen lift cooldown expired)")
++				debug.Log("Stream: writing idle (pen lift cooldown expired), slow refresh")
+ 				writing = false
+-				asyncReader.Pause()
++				asyncReader.SetInterval(idleInterval)
++				ticker.Reset(idleInterval)
+ 			}
+ 			cooldownActive = false
+ 		case <-ticker.C:
++			// Always send: at the adaptive rate while writing, every idleInterval
++			// otherwise (changes without pen/touch input must reach the viewer too).
++			next := idleInterval
+ 			if writing {
+-				next := rate * time.Millisecond
++				next = rate * time.Millisecond
+ 				if frameSize := h.fetchAndSendDeltaAsync(w, asyncReader, enc); frameSize > 0 {
+ 					next = adaptRate(frameSize, rate*time.Millisecond)
+ 				}
+-				ticker.Reset(next)
+-				// Keep the background reader paced to whatever rate we settled on.
+-				asyncReader.SetInterval(next)
++			} else {
++				h.fetchAndSendDeltaAsync(w, asyncReader, enc)
+ 			}
++			ticker.Reset(next)
++			// Keep the background reader paced to whatever rate we settled on.
++			asyncReader.SetInterval(next)
+ 		}
+ 	}
+ }
+--- a/client/worker_stream_processing.js
++++ b/client/worker_stream_processing.js
+@@ -309,7 +309,7 @@
+ 	// Copy previousFrame to imageData for rendering
+ 	imageData.set(previousFrame);
+ 
+-	// Send frame update
+-	postMessage({ type: 'update', data: imageData });
++	// Send frame update (changed=false for an empty delta: the screen did not change)
++	postMessage({ type: 'update', data: imageData, changed: payload.length > 0 });
+ }
+ 
+--- a/client/workersHandling.js
++++ b/client/workersHandling.js
+@@ -72,6 +72,12 @@
+ 			hideSleepOverlay();
+ 			updateConnectionStatus(ConnectionState.CONNECTED);
+ 
++			// A pending tablet rotation is applied together with the first frame
++			// that actually changed, so the old picture is never shown rotated.
++			if (data.changed !== false && typeof applyPendingOrientation === 'function') {
++				applyPendingOrientation();
++			}
++
+ 			// Handle the update
+ 			const frameData = event.data.data;
+ 			updateTexture(frameData, portrait, 1);
+--- a/client/uiInteractions.js
++++ b/client/uiInteractions.js
+@@ -757,6 +757,21 @@
+ let autoRotate = true;
+ let deviceOrientation = null;
+ let deviceStateVersion = 0;
++let pendingOrientationTimer = null;
++
++// Called by the stream handler on the first changed frame after a rotation,
++// with a timer as fallback in case the picture does not change.
++function applyPendingOrientation() {
++    if (pendingOrientationTimer === null) {
++        return;
++    }
++    clearTimeout(pendingOrientationTimer);
++    pendingOrientationTimer = null;
++    if (autoRotate) {
++        applyDeviceOrientation();
++        showMessage(`Tablet orientation: ${deviceOrientation}`, MessageDuration.QUICK);
++    }
++}
+ 
+ function setAutoRotate(on) {
+     autoRotate = on;
+@@ -801,11 +816,14 @@
+             if (state.orientation && state.orientation !== deviceOrientation) {
+                 const first = deviceOrientation === null;
+                 deviceOrientation = state.orientation;
+-                if (autoRotate) {
+-                    applyDeviceOrientation();
+-                    if (!first) {
+-                        showMessage(`Tablet orientation: ${deviceOrientation}`, MessageDuration.QUICK);
+-                    }
++                if (first) {
++                    if (autoRotate) applyDeviceOrientation();
++                } else if (pendingOrientationTimer === null) {
++                    // Wait for the re-rendered frame (the stream refreshes at least every 0.5 s).
++                    pendingOrientationTimer = setTimeout(() => {
++                        pendingOrientationTimer = -1;
++                        applyPendingOrientation();
++                    }, 2000);
+                 }
+             }
+         } catch (err) {

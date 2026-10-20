@@ -1,0 +1,16 @@
+[Unit]
+Description=rmshare: Cloudflare Tunnel -> proxy :8080
+After=network-online.target rmshare-proxy.service
+Wants=network-online.target rmshare-proxy.service
+
+[Service]
+Type=simple
+ExecStart=/home/root/rmshare/run-tunnel.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rmshare-tunnel
+
+[Install]
+WantedBy=multi-user.target

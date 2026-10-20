@@ -1,0 +1,6 @@
+pointer_arm64.patch
+stream_preempt.patch
+client_sleep.patch
+client_orientation.patch
+stream_idle_refresh.patch
+client_pen.patch

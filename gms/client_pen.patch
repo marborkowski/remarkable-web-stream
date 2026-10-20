@@ -1,0 +1,178 @@
+--- a/client/index.html
++++ b/client/index.html
+@@ -49,6 +49,15 @@
+ 							<div class="button-tooltip">Follow tablet orientation <kbd>A</kbd></div>
+ 						</button>
+ 					</li>
++					<li>
++						<button id="drawToggle" class="apple-button" aria-label="Draw on the tablet with mouse, touch or stylus (press D)" aria-pressed="false">
++							<svg class="button-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
++								<path fill="currentColor" d="M20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18,2.9 17.35,2.9 16.96,3.29L15.12,5.12L18.87,8.87M3,17.25V21H6.75L17.81,9.93L14.06,6.18L3,17.25Z"/>
++							</svg>
++							<span>Draw</span>
++							<div class="button-tooltip">Draw on the tablet <kbd>D</kbd></div>
++						</button>
++					</li>
+ 					<li id="layersMenuItem" style="display: none;">
+ 						<button id="switchOrderButton" class="apple-button" aria-label="Toggle layer order: drawing or content on top" aria-pressed="false">
+ 							<svg class="button-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+\ No newline at end of file
+@@ -213,6 +222,10 @@
+ 							<span>Follow tablet orientation (auto-rotate)</span>
+ 						</div>
+ 						<div class="help-item">
++							<kbd>D</kbd>
++							<span>Draw on the tablet (remote pen)</span>
++						</div>
++						<div class="help-item">
+ 							<kbd>L</kbd>
+ 							<span>Toggle laser pointer</span>
+ 						</div>
+\ No newline at end of file
+--- a/client/uiInteractions.js
++++ b/client/uiInteractions.js
+@@ -240,6 +240,10 @@
+             // Auto-rotate toggle
+             document.getElementById('autoRotate').click();
+             break;
++        case 'd':
++            // Remote pen toggle
++            document.getElementById('drawToggle').click();
++            break;
+         case 'l':
+             // Laser toggle
+             document.getElementById('laserToggle').click();
+@@ -847,3 +851,120 @@
+     btn.setAttribute('aria-pressed', autoRotate.toString());
+     pollDeviceState();
+ })();
++
++// ---------------------------------------------------------------------------
++// Remote pen: draw on the tablet with the mouse, a finger or a stylus.
++//
++// Pointer positions on the preview are converted back to the tablet's native
++// portrait coordinates (normalised 0..1), undoing the view rotation, and sent
++// over a WebSocket (/pen) to the rmshare proxy, which injects them as pen
++// events with a fixed pressure. xochitl draws them with the selected tool.
++// ---------------------------------------------------------------------------
++let drawMode = false;
++let penSocket = null;
++let penQueue = [];
++let penDown = false;
++
++function penConnect() {
++    if (penSocket && (penSocket.readyState === WebSocket.OPEN || penSocket.readyState === WebSocket.CONNECTING)) {
++        return;
++    }
++    const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
++    penSocket = new WebSocket(`${scheme}//${location.host}/pen`);
++    penSocket.onopen = () => penFlush();
++    penSocket.onclose = () => {
++        penSocket = null;
++        if (drawMode) {
++            setTimeout(penConnect, 2000);
++        }
++    };
++}
++
++function penFlush() {
++    if (penQueue.length && penSocket && penSocket.readyState === WebSocket.OPEN) {
++        penSocket.send(penQueue.join('\n'));
++        penQueue = [];
++    }
++}
++
++// Display position -> native portrait coordinates (0..1). Mirrors the laser
++// mapping in worker_event_processing.js: in the rotated view (portrait=true)
++// native X runs top->bottom and native Y right->left; flip is a 180° turn.
++function penNativeCoords(e) {
++    const rect = visibleCanvas.getBoundingClientRect();
++    let u = (e.clientX - rect.left) / rect.width;
++    let v = (e.clientY - rect.top) / rect.height;
++    if (flip) {
++        u = 1 - u;
++        v = 1 - v;
++    }
++    return portrait ? [v, 1 - u] : [u, v];
++}
++
++function penSend(cmd, e) {
++    if (cmd === 'u') {
++        penQueue.push('u');
++    } else {
++        const [x, y] = penNativeCoords(e);
++        penQueue.push(`${cmd} ${x.toFixed(5)} ${y.toFixed(5)}`);
++    }
++}
++
++function onPenDown(e) {
++    if (!drawMode || e.button > 0) return;
++    e.preventDefault();
++    visibleCanvas.setPointerCapture(e.pointerId);
++    penDown = true;
++    penSend('d', e);
++    penFlush();
++}
++
++function onPenMove(e) {
++    if (!drawMode || !penDown) return;
++    e.preventDefault();
++    const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
++    for (const ce of (events.length ? events : [e])) {
++        penSend('m', ce);
++    }
++    penFlush();
++}
++
++function onPenUp(e) {
++    if (!drawMode || !penDown) return;
++    e.preventDefault();
++    penDown = false;
++    penSend('m', e);
++    penSend('u');
++    penFlush();
++}
++
++function setDrawMode(on) {
++    drawMode = on;
++    const btn = document.getElementById('drawToggle');
++    btn.classList.toggle('toggled', on);
++    btn.setAttribute('aria-pressed', on.toString());
++    visibleCanvas.classList.toggle('draw-mode', on);
++    if (on) {
++        penConnect();
++    } else {
++        if (penDown) {
++            penDown = false;
++            penQueue.push('u');
++            penFlush();
++        }
++        if (penSocket) {
++            penSocket.close();
++        }
++    }
++}
++
++visibleCanvas.addEventListener('pointerdown', onPenDown);
++visibleCanvas.addEventListener('pointermove', onPenMove);
++visibleCanvas.addEventListener('pointerup', onPenUp);
++visibleCanvas.addEventListener('pointercancel', onPenUp);
++visibleCanvas.addEventListener('lostpointercapture', onPenUp);
++
++document.getElementById('drawToggle').addEventListener('click', function () {
++    setDrawMode(!drawMode);
++    showMessage(drawMode ? 'Drawing on the tablet: on (uses the tool selected on the tablet)' : 'Drawing on the tablet: off', MessageDuration.QUICK);
++});
+--- a/client/style.css
++++ b/client/style.css
+@@ -2123,4 +2123,10 @@
+ }
+ .sleep-overlay.visible {
+     display: flex;
++}
++
++/* Remote pen: drawing on the tablet from the browser */
++#canvas.draw-mode {
++    cursor: crosshair;
++    touch-action: none;
+ }

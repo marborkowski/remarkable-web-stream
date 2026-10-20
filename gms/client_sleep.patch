@@ -1,0 +1,190 @@
+--- a/client/worker_stream_processing.js
++++ b/client/worker_stream_processing.js
+@@ -63,6 +63,18 @@
+ 				severity: 'warning',
+ 				code: 'RATE_LIMITED',
+ 				message: 'Rate limited - too many clients',
++				retryable: true
++			});
++			return;
++		}
++
++		// Tablet asleep: the rmshare proxy answers 503 while the display sleeps
++		if (response.status === 503) {
++			postMessage({
++				type: 'error',
++				severity: 'error',
++				code: 'ASLEEP',
++				message: 'Tablet jest uśpiony',
+ 				retryable: true
+ 			});
+ 			return;
+--- a/client/workersHandling.js
++++ b/client/workersHandling.js
+@@ -4,36 +4,16 @@
+ let reconnectTimeout = null;
+ let isReconnecting = false;
+ 
+-// Calculate reconnection delay with exponential backoff (1s, 2s, 4s, 8s, 16s)
++// Calculate reconnection delay with exponential backoff (1s, 2s, 4s, 8s, max 10s)
+ function getReconnectDelay() {
+-	return Math.pow(2, reconnectAttempts) * 1000;
++	return Math.min(Math.pow(2, reconnectAttempts) * 1000, 10000);
+ }
+ 
+-// Attempt to reconnect the stream
+-function attemptStreamReconnect() {
+-	if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+-		updateConnectionStatus(ConnectionState.DISCONNECTED);
+-		hideReconnectBanner();
+-		showConnectionError(
+-			'Unable to connect to the stream after multiple attempts. Please check your connection and try again.',
+-			true,
+-			() => {
+-				reconnectAttempts = 0;
+-				attemptStreamReconnect();
+-			}
+-		);
+-		isReconnecting = false;
+-		return;
++// Restart the stream worker after a delay
++function scheduleStreamRestart(delay) {
++	if (reconnectTimeout) {
++		clearTimeout(reconnectTimeout);
+ 	}
+-
+-	isReconnecting = true;
+-	reconnectAttempts++;
+-	updateConnectionStatus(ConnectionState.RECONNECTING);
+-	showReconnectBanner(reconnectAttempts, MAX_RECONNECT_ATTEMPTS);
+-
+-	const delay = getReconnectDelay();
+-	console.log(`Reconnecting in ${delay/1000}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+-
+ 	reconnectTimeout = setTimeout(() => {
+ 		// Just replace the worker - don't send terminate
+ 		// The old worker will be garbage collected
+@@ -44,6 +24,25 @@
+ 	}, delay);
+ }
+ 
++// Attempt to reconnect the stream. Never gives up: the tablet may be asleep
++// or offline for hours, and the page should recover on its own.
++function attemptStreamReconnect() {
++	isReconnecting = true;
++	reconnectAttempts = Math.min(reconnectAttempts + 1, MAX_RECONNECT_ATTEMPTS);
++	showSleepOverlay('Brak połączenia z tabletem');
++	if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
++		updateConnectionStatus(ConnectionState.DISCONNECTED);
++		hideReconnectBanner();
++	} else {
++		updateConnectionStatus(ConnectionState.RECONNECTING);
++		showReconnectBanner(reconnectAttempts, MAX_RECONNECT_ATTEMPTS);
++	}
++
++	const delay = getReconnectDelay();
++	console.log(`Reconnecting in ${delay/1000}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
++	scheduleStreamRestart(delay);
++}
++
+ // Reset reconnection state on successful frame
+ function resetReconnectState() {
+ 	if (isReconnecting || reconnectAttempts > 0) {
+@@ -70,6 +69,7 @@
+ 		case 'update':
+ 			// Reset reconnection state on successful frame
+ 			resetReconnectState();
++			hideSleepOverlay();
+ 			updateConnectionStatus(ConnectionState.CONNECTED);
+ 
+ 			// Handle the update
+@@ -79,6 +79,17 @@
+ 		case 'error':
+ 			console.error('Error from worker:', event.data.message);
+ 
++			// Tablet asleep: blank the view and poll until it wakes up
++			if (data.code === 'ASLEEP') {
++				reconnectAttempts = 0;
++				isReconnecting = true;
++				hideReconnectBanner();
++				updateConnectionStatus(ConnectionState.ASLEEP);
++				showSleepOverlay('Tablet jest uśpiony');
++				scheduleStreamRestart(5000);
++				return;
++			}
++
+ 			// Check if this is a rate limit (429) error
+ 			if (data.code === 'RATE_LIMITED') {
+ 				updateConnectionStatus(ConnectionState.RATE_LIMITED);
+--- a/client/utilities.js
++++ b/client/utilities.js
+@@ -72,9 +72,23 @@
+ 	PAUSED: 'paused',
+ 	RATE_LIMITED: 'rate-limited',
+ 	RECONNECTING: 'reconnecting',
+-	DISCONNECTED: 'disconnected'
++	DISCONNECTED: 'disconnected',
++	ASLEEP: 'asleep'
+ };
++
++// Full-screen overlay hiding the last frame while the tablet is asleep or unreachable
++function showSleepOverlay(text) {
++	const overlay = document.getElementById('sleepOverlay');
++	if (!overlay) return;
++	overlay.querySelector('.sleep-overlay-text').textContent = text;
++	overlay.classList.add('visible');
++}
+ 
++function hideSleepOverlay() {
++	const overlay = document.getElementById('sleepOverlay');
++	if (overlay) overlay.classList.remove('visible');
++}
++
+ let statusHideTimeout = null;
+ 
+ // Timeout for collapsing status indicator to dot-only
+@@ -125,6 +139,10 @@
+ 			indicator.classList.add('disconnected');
+ 			if (statusLabel) statusLabel.textContent = 'Disconnected';
+ 			break;
++		case ConnectionState.ASLEEP:
++			indicator.classList.add('paused');
++			if (statusLabel) statusLabel.textContent = 'Tablet uśpiony';
++			break;
+ 	}
+ }
+ 
+--- a/client/index.html
++++ b/client/index.html
+@@ -132,6 +132,7 @@
+ 		</div>
+ 		<div id="container">
+ 			<canvas id="canvas"></canvas>
++			<div id="sleepOverlay" class="sleep-overlay" aria-live="polite"><div class="sleep-overlay-text"></div></div>
+ 			<div id="message" role="alert" aria-live="assertive"></div>
+ 			<div id="statusIndicator" class="status-indicator" role="status" aria-live="polite">
+ 				<span class="status-dot" aria-hidden="true"></span>
+\ No newline at end of file
+--- a/client/style.css
++++ b/client/style.css
+@@ -2107,3 +2107,20 @@
+         padding: 24px;
+     }
+ }
++
++/* Overlay shown instead of the last frame while the tablet sleeps / is unreachable */
++.sleep-overlay {
++    position: absolute;
++    inset: 0;
++    z-index: calc(var(--z-canvas) + 1);
++    display: none;
++    align-items: center;
++    justify-content: center;
++    background: var(--bg-elevated);
++    font-family: var(--font-sans);
++    font-size: 1.4rem;
++    opacity: 0.85;
++}
++.sleep-overlay.visible {
++    display: flex;
++}

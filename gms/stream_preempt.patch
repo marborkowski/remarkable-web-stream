@@ -1,0 +1,204 @@
+--- a/internal/stream/mdw.go
++++ b/internal/stream/mdw.go
+@@ -4,13 +4,14 @@
+ 	"context"
+ 	"net/http"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/owulveryck/goMarkableStream/internal/debug"
+ )
+ 
+ var (
+ 	activeWriters int
+-	maxWriters    = 1 // Maximum allowed writers
++	maxWriters    = 3 // Maximum concurrent viewers (each costs one framebuffer read + delta encode per frame)
+ 	mu            sync.Mutex
+ 	cond          = sync.NewCond(&mu)
+ 
+@@ -55,16 +56,27 @@
+ 		debug.Log("Throttle: connection from %s, activeWriters=%d", r.RemoteAddr, activeWriters)
+ 		mu.Lock()
+ 		if activeWriters >= maxWriters {
+-			mu.Unlock()
+-			debug.Log("Throttle: too many requests, rejecting (%s)", r.RemoteAddr)
+-			// If too many requests, send a 429 status code
+-			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+-			return
++			// Newest viewer wins: cancel the active stream(s) instead of
++			// rejecting with 429. A browser tab that went away behind a CDN
++			// or tunnel (Cloudflare does not propagate client disconnects
++			// promptly) would otherwise hold the slots for a long time,
++			// and the client does not retry after a 429.
++			debug.Log("Throttle: preempting %d active writer(s) for %s", activeWriters, r.RemoteAddr)
++			if streamCancel != nil {
++				streamCancel()
++			}
++			streamCtx, streamCancel = context.WithCancel(context.Background())
+ 		}
+ 
+-		for activeWriters > 0 {
++		// Wait (bounded) for preempted writers to notice the cancellation and
++		// finish; a writer stuck in a blocking socket write must not block
++		// the new viewer forever.
++		deadline := time.Now().Add(5 * time.Second)
++		for activeWriters >= maxWriters && time.Now().Before(deadline) {
+ 			debug.Log("Throttle: waiting for active writers to finish (%s)", r.RemoteAddr)
+-			cond.Wait() // Wait for active writers to finish
++			mu.Unlock()
++			time.Sleep(50 * time.Millisecond)
++			mu.Lock()
+ 		}
+ 
+ 		// Capture current stream context while holding lock
+--- a/internal/stream/handler.go
++++ b/internal/stream/handler.go
+@@ -52,6 +52,7 @@
+ 		pointerAddr:    pointerAddr,
+ 		inputEventsBus: inputEvents,
+ 		deltaEncoder:   delta.NewEncoder(deltaThreshold),
++		deltaThreshold: deltaThreshold,
+ 	}
+ }
+ 
+@@ -67,6 +68,11 @@
+ 	// concurrently, so the handler has to hold on its own.
+ 	session      sync.Mutex
+ 	deltaEncoder *delta.Encoder
++
++	// deltaThreshold is used to build one encoder per streaming connection,
++	// so several viewers can watch at the same time (ThrottlingMiddleware
++	// bounds how many).
++	deltaThreshold float64
+ }
+ 
+ // ReleaseMemory releases large buffers held by the stream handler's delta encoder.
+@@ -116,18 +122,11 @@
+ 		return
+ 	}
+ 
+-	// Claim the encoder for this connection. Taken after the preflight branch so
+-	// a CORS check never gets turned away by an in-flight stream.
+-	if !h.session.TryLock() {
+-		debug.Log("Stream: rejecting %s, another connection owns the encoder", r.RemoteAddr)
+-		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+-		return
+-	}
+-	defer h.session.Unlock()
++	// One delta encoder per connection: its previous-frame state is private to
++	// this viewer, so concurrent viewers do not corrupt each other's deltas.
++	enc := delta.NewEncoder(h.deltaThreshold)
++	defer enc.ReleaseMemory()
+ 
+-	// Reset delta encoder to force a full frame for the new client
+-	h.deltaEncoder.Reset()
+-
+ 	// Subscribe only to EvAbs events (pen position and pressure)
+ 	// This filters out unnecessary EvSyn, EvKey, etc.
+ 	absType := uint16(events.EvAbs)
+@@ -230,7 +229,7 @@
+ 		case <-ticker.C:
+ 			if writing {
+ 				next := rate * time.Millisecond
+-				if frameSize := h.fetchAndSendDeltaAsync(w, asyncReader); frameSize > 0 {
++				if frameSize := h.fetchAndSendDeltaAsync(w, asyncReader, enc); frameSize > 0 {
+ 					next = adaptRate(frameSize, rate*time.Millisecond)
+ 				}
+ 				ticker.Reset(next)
+@@ -303,7 +302,7 @@
+ 	}
+ }
+ 
+-func (h *StreamHandler) fetchAndSendDeltaAsync(w io.Writer, reader *AsyncFrameReader) int {
++func (h *StreamHandler) fetchAndSendDeltaAsync(w io.Writer, reader *AsyncFrameReader, enc *delta.Encoder) int {
+ 	frame := reader.Latest()
+ 	if frame == nil {
+ 		return 0 // no new frame available yet
+@@ -312,7 +311,7 @@
+ 	span := trace.BeginSpan("fetch_and_send")
+ 	defer trace.EndSpan(span, nil)
+ 
+-	frameSize, err := h.deltaEncoder.EncodeWithSize(frame, w)
++	frameSize, err := enc.EncodeWithSize(frame, w)
+ 	if err != nil {
+ 		log.Println("Error in delta encoding", err)
+ 		return 0
+--- a/internal/stream/handler_test.go
++++ b/internal/stream/handler_test.go
+@@ -141,55 +141,46 @@
+ 	return len(p), nil
+ }
+ 
+-// TestStreamHandler_SecondConnectionRejected covers the concurrency contract of
+-// StreamHandler itself. Its delta encoder is per-connection state, and until now
+-// two concurrent ServeHTTP calls would trample it — ThrottlingMiddleware kept
+-// that from biting in production, but the handler must hold on its own, since
+-// net/http is free to call any handler concurrently.
+-func TestStreamHandler_SecondConnectionRejected(t *testing.T) {
++// TestStreamHandler_ConcurrentConnections covers the concurrency contract of
++// StreamHandler: every streaming connection gets its own delta encoder, so two
++// concurrent ServeHTTP calls both stream (ThrottlingMiddleware bounds how many
++// viewers are admitted; the handler itself must be safe for any number).
++func TestStreamHandler_ConcurrentConnections(t *testing.T) {
+ 	h := NewStreamHandler(&countingReaderAt{}, 0, pubsub.NewPubSub(), 0.30)
+ 
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
+ 
+ 	first := newStreamingWriter()
+-	done := make(chan struct{})
+-	go func() {
+-		defer close(done)
+-		h.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/stream?rate=5", nil).WithContext(ctx))
+-	}()
+-
+-	select {
+-	case <-first.closed:
+-	case <-time.After(5 * time.Second):
+-		t.Fatal("first connection never streamed a frame")
++	second := newStreamingWriter()
++	done := make(chan struct{}, 2)
++	for _, w := range []*streamingWriter{first, second} {
++		go func(w *streamingWriter) {
++			defer func() { done <- struct{}{} }()
++			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/stream?rate=5", nil).WithContext(ctx))
++		}(w)
+ 	}
+ 
+-	rec := httptest.NewRecorder()
+-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stream", nil))
+-	if rec.Code != http.StatusTooManyRequests {
+-		t.Errorf("second connection: status %d, want %d", rec.Code, http.StatusTooManyRequests)
++	for i, w := range []*streamingWriter{first, second} {
++		select {
++		case <-w.closed:
++		case <-time.After(5 * time.Second):
++			t.Fatalf("connection %d never streamed a frame", i+1)
++		}
+ 	}
+ 
+-	// Releasing memory under an active stream must be a no-op, not a block and
+-	// not a concurrent reset of buffers the encoder is using.
++	// Releasing memory under active streams must be a no-op, not a block.
+ 	released := make(chan struct{})
+ 	go func() { h.ReleaseMemory(); close(released) }()
+ 	select {
+ 	case <-released:
+ 	case <-time.After(time.Second):
+-		t.Error("ReleaseMemory blocked while a stream was active")
++		t.Error("ReleaseMemory blocked while streams were active")
+ 	}
+ 
+ 	cancel()
+ 	<-done
+-
+-	// Once the stream is gone the handler accepts a new connection again.
+-	if !h.session.TryLock() {
+-		t.Error("encoder still held after the connection closed")
+-	} else {
+-		h.session.Unlock()
+-	}
++	<-done
+ }
+ 
+ // TestStreamHandler_PreflightDuringStream checks that the CORS preflight is
