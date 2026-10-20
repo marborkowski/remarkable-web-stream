@@ -11,27 +11,27 @@ import (
 	"time"
 )
 
-// viewerSignal sygnalizuje na tablecie, że ktoś zaczął lub przestał oglądać
-// strumień: mrugnięciem podświetlenia (front light). xochitl nie ma lokalnego
-// API powiadomień, a e-ink nie odświeży pikseli dopisanych z zewnątrz, więc to
-// najpewniejszy sygnał widoczny dla osoby z tabletem w ręku.
+// viewerSignal tells the person holding the tablet that someone started or
+// stopped watching the stream, by blinking the front light. xochitl has no
+// local notification API, and e-ink will not refresh pixels written from
+// outside, so this is the most dependable signal visible on the device.
 //
-//   - widz połączony (strumień trwa >= connectDelay): dwa krótkie mrugnięcia,
-//   - ostatni widz odszedł (brak widzów przez goneDelay): jedno długie.
+//   - viewer connected (stream open for >= connectDelay): two short blinks,
+//   - last viewer left (no viewers for goneDelay): one long blink.
 //
-// Opóźnienia odfiltrowują odświeżenia strony i chwilowe zerwania połączenia.
+// The delays filter out page reloads and brief connection drops.
 type viewerSignal struct {
-	light        string // katalog sysfs podświetlenia, "" = wyłączone
+	light        string // sysfs backlight directory, "" = disabled
 	isAwake      func() bool
 	connectDelay time.Duration
 	goneDelay    time.Duration
 
 	mu        sync.Mutex
 	active    int
-	announced bool        // zasygnalizowano "połączony", jeszcze nie "odszedł"
-	goneTimer *time.Timer // odlicza goneDelay po odejściu ostatniego widza
+	announced bool        // "connected" was signalled, "left" not yet
+	goneTimer *time.Timer // counts goneDelay down after the last viewer left
 
-	pulseMu sync.Mutex // serializuje mrugnięcia, żeby zawsze wrócić do jasności użytkownika
+	pulseMu sync.Mutex // serialises blinks so the user brightness is always restored
 }
 
 func newViewerSignal(light string, isAwake func() bool) *viewerSignal {
@@ -47,7 +47,7 @@ func (v *viewerSignal) viewers() int {
 	return v.active
 }
 
-// wrap liczy aktywne strumienie /stream przechodzące przez proxy.
+// wrap counts active /stream requests passing through the proxy.
 func (v *viewerSignal) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/stream" {
@@ -80,7 +80,7 @@ func (v *viewerSignal) connected() {
 		n := v.active
 		v.mu.Unlock()
 		if fire {
-			log.Printf("widz połączony (aktywne strumienie: %d) - sygnalizuję na tablecie", n)
+			log.Printf("viewer connected (active streams: %d) - signalling on the tablet", n)
 			v.pulse(2, 300*time.Millisecond)
 		}
 	})
@@ -104,14 +104,14 @@ func (v *viewerSignal) disconnected() {
 		}
 		v.mu.Unlock()
 		if fire {
-			log.Printf("ostatni widz odszedł - sygnalizuję na tablecie")
+			log.Printf("last viewer left - signalling on the tablet")
 			v.pulse(1, 900*time.Millisecond)
 		}
 	})
 }
 
-// pulse mruga podświetleniem n razy i przywraca dokładnie poprzednią jasność.
-// Pomija sygnał, gdy tablet śpi (nie chcemy zapalać światła uśpionemu tabletowi).
+// pulse blinks the front light n times and restores the exact previous
+// brightness. It is skipped while the tablet sleeps (never light up a sleeping tablet).
 func (v *viewerSignal) pulse(n int, on time.Duration) {
 	if v.light == "" || (v.isAwake != nil && !v.isAwake()) {
 		return
@@ -122,7 +122,7 @@ func (v *viewerSignal) pulse(n int, on time.Duration) {
 	path := filepath.Join(v.light, "brightness")
 	b, err := os.ReadFile(path)
 	if err != nil {
-		log.Printf("sygnał: nie mogę odczytać podświetlenia: %v", err)
+		log.Printf("signal: cannot read the front light: %v", err)
 		return
 	}
 	cur, err := strconv.Atoi(strings.TrimSpace(string(b)))
@@ -135,7 +135,7 @@ func (v *viewerSignal) pulse(n int, on time.Duration) {
 			max = m
 		}
 	}
-	// Jasne światło -> mrugnięcie przygaszeniem; ciemne/wyłączone -> rozjaśnieniem.
+	// Bright light -> blink by dimming; dim/off -> blink by brightening.
 	level := cur / 8
 	if cur <= max/2 {
 		level = cur + max*45/100

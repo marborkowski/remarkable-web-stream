@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"os"
@@ -18,10 +19,10 @@ import (
 	qrcode "github.com/skip2/go-qrcode"
 )
 
-// Nazwa dokumentu widoczna w bibliotece na tablecie.
-const docVisibleName = "reMarkable Live – adres"
+// Name of the document shown in the tablet's library.
+const docVisibleName = "reMarkable Live – URL"
 
-// urlState trzyma aktualny publiczny adres tunelu (z tunnel-url.txt).
+// urlState holds the current public tunnel URL (from tunnel-url.txt).
 type urlState struct {
 	mu  sync.RWMutex
 	url string
@@ -33,11 +34,11 @@ func (s *urlState) get() string {
 	return s.url
 }
 
-// watchURLFile co kilka sekund czyta plik z adresem; gdy adres się zmieni,
-// aktualizuje stan i (opcjonalnie) publikuje dokument PDF w bibliotece xochitl.
+// watchURLFile reads the URL file every few seconds; when the URL changes it
+// updates the state and (optionally) publishes a PDF to the xochitl library.
 func watchURLFile(path string, publishDoc bool, xochitlDir string, st *urlState) {
-	// Adres już opublikowany w dokumencie jest zapamiętany obok pliku z adresem,
-	// żeby restart proxy nie publikował go (i nie restartował xochitl) ponownie.
+	// The URL already published in the document is remembered next to the URL
+	// file, so restarting the proxy does not republish it (and restart xochitl).
 	publishedFile := path + ".published"
 	published := ""
 	if b, err := os.ReadFile(publishedFile); err == nil {
@@ -56,10 +57,10 @@ func watchURLFile(path string, publishDoc bool, xochitlDir string, st *urlState)
 			st.url = cur
 			st.mu.Unlock()
 			if cur != "" {
-				log.Printf("adres tunelu: %s", cur)
+				log.Printf("tunnel URL: %s", cur)
 				if publishDoc && cur != published {
 					if err := publishURLDocument(xochitlDir, cur); err != nil {
-						log.Printf("nie udało się opublikować dokumentu z adresem: %v", err)
+						log.Printf("failed to publish the URL document: %v", err)
 					} else {
 						published = cur
 						_ = os.WriteFile(publishedFile, []byte(cur+"\n"), 0o644)
@@ -71,13 +72,13 @@ func watchURLFile(path string, publishDoc bool, xochitlDir string, st *urlState)
 	}
 }
 
-// publishURLDocument zapisuje w bibliotece xochitl dokument PDF (adres + kod QR)
-// i restartuje xochitl oraz streamer, żeby tablet go zobaczył. UUID dokumentu
-// jest stały (zapisany obok pliku z adresem), więc kolejne adresy nadpisują
-// ten sam dokument zamiast mnożyć kopie.
+// publishURLDocument writes a PDF document (URL + QR code) to the xochitl
+// library and restarts xochitl and the streamer so the tablet picks it up. The
+// document UUID is stable (stored on disk), so later URLs overwrite the same
+// document instead of piling up copies.
 func publishURLDocument(xochitlDir, url string) error {
 	if _, err := os.Stat(xochitlDir); err != nil {
-		return fmt.Errorf("brak katalogu xochitl %s: %w", xochitlDir, err)
+		return fmt.Errorf("xochitl directory %s not found: %w", xochitlDir, err)
 	}
 	id, err := stableDocID(filepath.Join(filepath.Dir(xochitlDir), "rmshare-doc-id"))
 	if err != nil {
@@ -111,13 +112,13 @@ func publishURLDocument(xochitlDir, url string) error {
 	if err := writeJSON(base+".content", content); err != nil {
 		return err
 	}
-	// Katalog na adnotacje; xochitl lubi, gdy istnieje.
+	// Annotation directory; xochitl expects it to exist.
 	_ = os.MkdirAll(base, 0o755)
 
-	log.Printf("dokument %q zapisany (%s), restartuję xochitl", docVisibleName, id)
-	// goMarkableStream znajduje bufor ekranu przy starcie, więc po restarcie
-	// xochitl musi wystartować ponownie — ale dopiero gdy xochitl zdąży
-	// zmapować ekran (inaczej kończy się błędem "no mapping found").
+	log.Printf("document %q written (%s), restarting xochitl", docVisibleName, id)
+	// goMarkableStream locates the framebuffer at startup, so it has to be
+	// restarted after xochitl, but only once xochitl has mapped the screen
+	// (otherwise it fails with "no mapping found").
 	if out, err := exec.Command("systemctl", "restart", "xochitl.service").CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl restart xochitl: %v: %s", err, out)
 	}
@@ -136,7 +137,7 @@ func writeJSON(path string, v any) error {
 	return os.WriteFile(path, b, 0o644)
 }
 
-// stableDocID zwraca UUID zapisany w pliku, tworząc go przy pierwszym użyciu.
+// stableDocID returns the UUID stored in a file, creating it on first use.
 func stableDocID(path string) (string, error) {
 	if b, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(b))) == 36 {
 		return strings.TrimSpace(string(b)), nil
@@ -151,15 +152,15 @@ func stableDocID(path string) (string, error) {
 	return id, os.WriteFile(path, []byte(id+"\n"), 0o644)
 }
 
-// buildURLPDF tworzy jednostronicowy PDF (A4-ish, proporcje ekranu rM) z tytułem,
-// adresem i kodem QR. Bez zewnętrznych bibliotek: tekst Helvetica + obraz
-// w skali szarości skompresowany Flate.
+// buildURLPDF builds a one-page PDF (reMarkable screen proportions) with a
+// title, the URL and a QR code. No external libraries: Helvetica text plus a
+// Flate-compressed greyscale image.
 func buildURLPDF(url string) ([]byte, error) {
 	qr, err := qrcode.New(url, qrcode.Medium)
 	if err != nil {
 		return nil, err
 	}
-	bm := qr.Bitmap() // zawiera już margines ciszy
+	bm := qr.Bitmap() // already includes the quiet zone
 	n := len(bm)
 	raster := make([]byte, n*n)
 	for y := 0; y < n; y++ {
@@ -176,15 +177,15 @@ func buildURLPDF(url string) ([]byte, error) {
 	zw.Write(raster)
 	zw.Close()
 
-	// Strona 445x594 pt (proporcje 3:4 jak ekran reMarkable).
+	// 445x594 pt page (3:4, like the reMarkable screen).
 	const pw, ph = 445.0, 594.0
 	qrSize := 300.0
 	qrX := (pw - qrSize) / 2
 	qrY := 150.0
 	content := fmt.Sprintf(
 		"BT /F1 22 Tf 40 540 Td (reMarkable Live) Tj ET\n"+
-			"BT /F2 11 Tf 40 515 Td (Zeskanuj kod lub wpisz adres w przegladarce, potem podaj haslo.) Tj ET\n"+
-			"BT /F2 9 Tf 40 500 Td (Wygenerowano: %s) Tj ET\n"+
+			"BT /F2 11 Tf 40 515 Td (Scan the code or type the URL into a browser, then enter the password.) Tj ET\n"+
+			"BT /F2 9 Tf 40 500 Td (Generated: %s) Tj ET\n"+
 			"q %.0f 0 0 %.0f %.0f %.0f cm /Im1 Do Q\n"+
 			"BT /F1 %d Tf %.0f 110 Td (%s) Tj ET\n",
 		time.Now().Format("2006-01-02 15:04"),
@@ -219,9 +220,9 @@ func buildURLPDF(url string) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// urlFontSize dobiera rozmiar czcionki tak, by adres zmieścił się na stronie.
+// urlFontSize picks a font size so the URL fits on the page.
 func urlFontSize(url string) int {
-	// Helvetica-Bold ~0.6 em na znak; szerokość tekstu 365 pt.
+	// Helvetica-Bold is ~0.6 em per character; text width is 365 pt.
 	size := int(365.0 / (0.6 * float64(len(url))))
 	if size > 18 {
 		size = 18
@@ -237,14 +238,14 @@ func pdfEscape(s string) string {
 	return r.Replace(s)
 }
 
-// urlPageHTML to strona /url: aktualny adres + QR.
-const urlPageHTML = `<!doctype html><html lang="pl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>reMarkable Live – adres</title>
+// urlPageHTML is the /url page: the current URL + QR code.
+const urlPageHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>reMarkable Live – URL</title>
 <style>body{font-family:-apple-system,system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#f3f1ec;color:#1d1d1b}
 main{text-align:center;padding:24px}a{word-break:break-all;font-size:1.1rem}img{width:min(70vw,320px);image-rendering:pixelated}
 p.sub{opacity:.65}</style></head><body><main>
-<h1>Aktualny adres</h1>%s
-<p class="sub"><a href="/">← wróć do podglądu</a> · <a href="/url?format=txt">tekst</a></p></main></body></html>`
+<h1>Current URL</h1>%s
+<p class="sub"><a href="/">← back to the preview</a> · <a href="/url?format=txt">plain text</a></p></main></body></html>`
 
 func handleURL(st *urlState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -255,9 +256,10 @@ func handleURL(st *urlState) http.HandlerFunc {
 			fmt.Fprintln(w, u)
 			return
 		}
-		body := "<p>Adres nie jest jeszcze znany (tunel się uruchamia).</p>"
+		body := "<p>The URL is not known yet (the tunnel is starting).</p>"
 		if u != "" {
-			body = fmt.Sprintf(`<p><a href="%s">%s</a></p><img src="/url/qr.png" alt="QR">`, u, u)
+			e := html.EscapeString(u)
+			body = fmt.Sprintf(`<p><a href="%s">%s</a></p><img src="/url/qr.png" alt="QR code">`, e, e)
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprintf(w, urlPageHTML, body)

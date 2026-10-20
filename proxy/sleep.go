@@ -14,28 +14,29 @@ import (
 	"time"
 )
 
-// journal -o cat zachowuje kody kolorów ANSI z logów xochitl.
+// journalctl -o cat keeps the ANSI colour codes from xochitl's log lines.
 var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 
-// sleepWatcher śledzi stan wyświetlacza xochitl ("Normal" / "DeepSleep").
+// sleepWatcher follows xochitl's display state ("Normal" / "DeepSleep").
 //
-// Paper Pro na kablu USB nie wchodzi w suspend (blokada udev.charger), więc po
-// uśpieniu ekranu procesy i Wi-Fi dalej działają. Jedynym wiarygodnym sygnałem
-// jest log xochitl: "Changing display state from Normal to DeepSleep".
-// Gdy tablet śpi, proxy odrzuca strumień (503) i zrywa aktywne połączenia.
+// A Paper Pro connected to USB never really suspends (udev.charger holds a
+// wake lock), so processes and Wi-Fi keep running after the screen goes to
+// sleep. The only reliable signal is xochitl's log line
+// "Changing display state from Normal to DeepSleep". While the tablet sleeps,
+// the proxy rejects streaming requests (503) and drops active connections.
 //
-// Z tego samego logu czyta też orientację interfejsu ("Setting new orientation
-// Landscape"), żeby podgląd w przeglądarce obracał się razem z tabletem.
+// The same log also carries the UI orientation ("Setting new orientation
+// Landscape"), so the browser preview can rotate together with the tablet.
 type sleepWatcher struct {
 	mu     sync.Mutex
 	awake  bool
 	since  time.Time
-	ctx    context.Context // anulowany przy przejściu w sen
+	ctx    context.Context // cancelled when the tablet goes to sleep
 	cancel context.CancelFunc
 
 	orientation string        // Portrait / Landscape / InvertedLandscape / InvertedPortrait
-	version     uint64        // rośnie przy każdej zmianie stanu (awake lub orientacja)
-	changed     chan struct{} // zamykany i podmieniany przy każdej zmianie (long-poll /state)
+	version     uint64        // incremented on every state change (awake or orientation)
+	changed     chan struct{} // closed and replaced on every change (/state long-poll)
 }
 
 func newSleepWatcher() *sleepWatcher {
@@ -46,7 +47,7 @@ func newSleepWatcher() *sleepWatcher {
 	}
 }
 
-// bumpLocked ogłasza zmianę stanu czekającym long-pollom. Wymaga s.mu.
+// bumpLocked announces a state change to waiting long-polls. Requires s.mu.
 func (s *sleepWatcher) bumpLocked() {
 	s.version++
 	close(s.changed)
@@ -59,7 +60,7 @@ func (s *sleepWatcher) setOrientation(o string) {
 	if o == s.orientation {
 		return
 	}
-	log.Printf("orientacja tabletu: %s", o)
+	log.Printf("tablet orientation: %s", o)
 	s.orientation = o
 	s.bumpLocked()
 }
@@ -70,8 +71,8 @@ func (s *sleepWatcher) isAwake() bool {
 	return s.awake
 }
 
-// awakeContext zwraca kontekst bieżącego okresu czuwania; zostaje anulowany,
-// gdy tablet zaśnie. Pobierz go na początku żądania.
+// awakeContext returns the context of the current awake period; it is
+// cancelled when the tablet goes to sleep. Grab it at the start of a request.
 func (s *sleepWatcher) awakeContext() context.Context {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -88,16 +89,17 @@ func (s *sleepWatcher) set(awake bool) {
 	s.since = time.Now()
 	s.bumpLocked()
 	if awake {
-		log.Printf("tablet obudzony: streaming dozwolony")
+		log.Printf("tablet awake: streaming allowed")
 		return
 	}
-	log.Printf("tablet uśpiony: zrywam strumienie, streaming zablokowany")
+	log.Printf("tablet asleep: dropping streams, streaming blocked")
 	s.cancel()
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 }
 
-// parseDisplayState wyciąga nowy stan z linii logu xochitl.
-// Zwraca (stan, true) albo ("", false), gdy linia nie dotyczy stanu wyświetlacza.
+// parseDisplayState extracts the new state from a xochitl log line.
+// It returns (state, true), or ("", false) when the line is not about the
+// display state.
 func parseDisplayState(line string) (string, bool) {
 	const marker = "Changing display state from "
 	line = ansiEscape.ReplaceAllString(line, "")
@@ -112,7 +114,7 @@ func parseDisplayState(line string) (string, bool) {
 	return f[2], true
 }
 
-// parseOrientation wyciąga orientację interfejsu z linii logu xochitl:
+// parseOrientation extracts the UI orientation from a xochitl log line:
 //
 //	rm.orientationmodule  Setting new orientation Landscape (setOrientation ...)
 //	rm.orientationmodule  Setting forced portrait window orientation Portrait (...)
@@ -136,7 +138,7 @@ func parseOrientation(line string) (string, bool) {
 	return "", false
 }
 
-// handleLine aktualizuje stan na podstawie jednej linii logu xochitl.
+// handleLine updates the state from one xochitl log line.
 func (s *sleepWatcher) handleLine(line string) {
 	if st, ok := parseDisplayState(line); ok {
 		s.set(st == "Normal")
@@ -146,10 +148,10 @@ func (s *sleepWatcher) handleLine(line string) {
 	}
 }
 
-// run śledzi journal xochitl; przy błędzie próbuje ponownie co kilka sekund.
+// run follows the xochitl journal; on error it retries every few seconds.
 func (s *sleepWatcher) run(unit string) {
 	if _, err := exec.LookPath("journalctl"); err != nil {
-		log.Printf("sleep-watch: brak journalctl, zakładam że tablet zawsze czuwa")
+		log.Printf("sleep-watch: journalctl not found, assuming the tablet is always awake")
 		return
 	}
 	for {
@@ -170,12 +172,12 @@ func (s *sleepWatcher) run(unit string) {
 			s.handleLine(sc.Text())
 		}
 		_ = cmd.Wait()
-		log.Printf("sleep-watch: journalctl zakończył się, wznawiam")
+		log.Printf("sleep-watch: journalctl exited, restarting")
 		time.Sleep(5 * time.Second)
 	}
 }
 
-// syncInitialState ustala stan na podstawie ostatniego wpisu od startu systemu.
+// syncInitialState derives the state from the last matching entries since boot.
 func (s *sleepWatcher) syncInitialState(unit string) {
 	out, err := exec.Command("journalctl", "-u", unit, "-b", "--no-pager", "-o", "cat").Output()
 	if err != nil {
@@ -194,7 +196,7 @@ func (s *sleepWatcher) syncInitialState(unit string) {
 	s.setOrientation(orientation)
 }
 
-// isStreamPath mówi, które ścieżki upstreamu niosą obraz lub zdarzenia z ekranu.
+// isStreamPath reports which upstream paths carry screen images or events.
 func isStreamPath(p string) bool {
 	switch p {
 	case "/stream", "/screenshot", "/events", "/gestures", "/raw":
@@ -203,8 +205,8 @@ func isStreamPath(p string) bool {
 	return false
 }
 
-// gateSleep blokuje ścieżki strumieniowe, gdy tablet śpi, a aktywne żądania
-// zrywa w chwili zaśnięcia.
+// gateSleep blocks streaming paths while the tablet sleeps, and drops active
+// requests the moment it falls asleep.
 func gateSleep(sw *sleepWatcher, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !isStreamPath(r.URL.Path) {
@@ -231,9 +233,9 @@ func gateSleep(sw *sleepWatcher, next http.Handler) http.Handler {
 	})
 }
 
-// handleState zwraca stan tabletu. Z parametrem ?wait=<version> działa jako
-// long-poll: jeśli wersja się nie zmieniła, czeka do 25 s na zmianę (orientacji
-// lub uśpienia), więc przeglądarka dowiaduje się o obrocie od razu.
+// handleState returns the tablet state. With ?wait=<version> it acts as a
+// long-poll: if the version has not changed, it waits up to 25 s for a change
+// (orientation or sleep), so the browser learns about a rotation right away.
 func handleState(sw *sleepWatcher, vs *viewerSignal) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if v := r.URL.Query().Get("wait"); v != "" {

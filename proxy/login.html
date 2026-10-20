@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="pl">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -36,10 +36,10 @@
 <body>
 <form method="post" action="/login" autocomplete="off">
   <h1>reMarkable Live</h1>
-  <p class="sub">Podaj hasło, aby zobaczyć ekran na żywo.</p>
+  <p class="sub">Enter the password to watch the screen live.</p>
   {{if .Error}}<p class="err">{{.Error}}</p>{{end}}
-  <input type="password" name="password" placeholder="Hasło" autofocus required>
-  <button type="submit">Wejdź</button>
+  <input type="password" name="password" placeholder="Password" autofocus required>
+  <button type="submit">Sign in</button>
 </form>
 </body>
 </html>

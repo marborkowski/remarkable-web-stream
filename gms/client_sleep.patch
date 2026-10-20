@@ -15,7 +15,7 @@
 +				type: 'error',
 +				severity: 'error',
 +				code: 'ASLEEP',
-+				message: 'Tablet jest uśpiony',
++				message: 'The tablet is asleep',
  				retryable: true
  			});
  			return;
@@ -73,7 +73,7 @@
 +function attemptStreamReconnect() {
 +	isReconnecting = true;
 +	reconnectAttempts = Math.min(reconnectAttempts + 1, MAX_RECONNECT_ATTEMPTS);
-+	showSleepOverlay('Brak połączenia z tabletem');
++	showSleepOverlay('Cannot reach the tablet');
 +	if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
 +		updateConnectionStatus(ConnectionState.DISCONNECTED);
 +		hideReconnectBanner();
@@ -108,7 +108,7 @@
 +				isReconnecting = true;
 +				hideReconnectBanner();
 +				updateConnectionStatus(ConnectionState.ASLEEP);
-+				showSleepOverlay('Tablet jest uśpiony');
++				showSleepOverlay('The tablet is asleep');
 +				scheduleStreamRestart(5000);
 +				return;
 +			}
@@ -149,7 +149,7 @@
  			break;
 +		case ConnectionState.ASLEEP:
 +			indicator.classList.add('paused');
-+			if (statusLabel) statusLabel.textContent = 'Tablet uśpiony';
++			if (statusLabel) statusLabel.textContent = 'Tablet asleep';
 +			break;
  	}
  }

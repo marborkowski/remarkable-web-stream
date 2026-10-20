@@ -17,17 +17,17 @@ import (
 	"golang.org/x/net/websocket"
 )
 
-// Zdalne pióro: przeglądarka wysyła przez WebSocket /pen ruchy myszy/dotyku
-// (współrzędne znormalizowane 0..1 w natywnym, pionowym układzie ekranu), a
-// proxy wstrzykuje je jako zdarzenia evdev do urządzenia pióra. xochitl czyta
-// to urządzenie bezpośrednio, więc traktuje je jak prawdziwe pióro, ze stałym
-// naciskiem (penPressureFraction).
+// Remote pen: the browser sends mouse/touch movements over the /pen WebSocket
+// (coordinates normalised to 0..1 in the native portrait screen space), and
+// the proxy injects them as evdev events into the pen input device. xochitl
+// reads that device directly, so it treats them like the real pen, with a
+// fixed pressure (penPressureFraction).
 //
-// Protokół (ramki tekstowe, kilka komend w ramce oddzielonych '\n'):
+// Protocol (text frames, several commands per frame separated by '\n'):
 //
-//	d <x> <y>   przyłożenie pióra
-//	m <x> <y>   ruch (z naciskiem, jeśli przyłożone)
-//	u           podniesienie
+//	d <x> <y>   pen down
+//	m <x> <y>   move (with pressure while the pen is down)
+//	u           pen up
 const penPressureFraction = 0.5
 
 const (
@@ -35,7 +35,7 @@ const (
 	absX, absY, absPressure, absDistance = 0x00, 0x01, 0x18, 0x19
 	btnToolPen, btnTouch                 = 0x140, 0x14a
 
-	penStallTimeout = 1500 * time.Millisecond // przyłożone pióro bez ruchu -> podnieś
+	penStallTimeout = 1500 * time.Millisecond // pen down without movement -> lift it
 )
 
 type penWriter struct {
@@ -45,7 +45,7 @@ type penWriter struct {
 	f              *os.File
 	maxX, maxY     int32
 	pressure       int32
-	owner          any // sesja, która ma teraz pióro (nil = wolne)
+	owner          any // session currently holding the pen (nil = free)
 	inRange, touch bool
 	lastEvent      time.Time
 }
@@ -60,7 +60,7 @@ type absInfo struct{ Value, Min, Max, Fuzz, Flat, Res int32 }
 
 func readAbsMax(f *os.File, code int, fallback int32) int32 {
 	var a absInfo
-	req := uintptr(0x80184540 + code) // EVIOCGABS(code)
+	req := uintptr(0x80184540) + uintptr(code) // EVIOCGABS(code)
 	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), req, uintptr(unsafe.Pointer(&a))); e != 0 || a.Max <= 0 {
 		return fallback
 	}
@@ -76,24 +76,38 @@ func (p *penWriter) openLocked() error {
 		return err
 	}
 	p.f = f
-	// Wartości domyślne z reMarkable Paper Pro, gdyby ioctl się nie udał.
+	// reMarkable Paper Pro values, used if the ioctl fails.
 	p.maxX = readAbsMax(f, absX, 11180)
 	p.maxY = readAbsMax(f, absY, 15340)
 	p.pressure = int32(float64(readAbsMax(f, absPressure, 4096)) * penPressureFraction)
-	log.Printf("zdalne pióro: %s (X 0..%d, Y 0..%d, nacisk %d)", p.path, p.maxX, p.maxY, p.pressure)
+	log.Printf("remote pen: %s (X 0..%d, Y 0..%d, pressure %d)", p.path, p.maxX, p.maxY, p.pressure)
 	return nil
 }
 
+// wordSize is the size of a C long. struct timeval is two longs, so
+// struct input_event is 24 bytes on arm64 and 16 bytes on 32-bit ARM.
+const wordSize = int(unsafe.Sizeof(uintptr(0)))
+
+// encodeInputEvent serialises a struct input_event for the running architecture.
+func encodeInputEvent(now time.Time, typ, code uint16, value int32) []byte {
+	b := make([]byte, 2*wordSize+8)
+	if wordSize == 8 {
+		binary.LittleEndian.PutUint64(b[0:], uint64(now.Unix()))
+		binary.LittleEndian.PutUint64(b[8:], uint64(now.Nanosecond()/1000))
+	} else {
+		binary.LittleEndian.PutUint32(b[0:], uint32(now.Unix()))
+		binary.LittleEndian.PutUint32(b[4:], uint32(now.Nanosecond()/1000))
+	}
+	t := 2 * wordSize
+	binary.LittleEndian.PutUint16(b[t:], typ)
+	binary.LittleEndian.PutUint16(b[t+2:], code)
+	binary.LittleEndian.PutUint32(b[t+4:], uint32(value))
+	return b
+}
+
 func (p *penWriter) emitLocked(typ, code uint16, value int32) {
-	var b [24]byte // struct input_event na 64-bit: timeval(16) + type + code + value
-	now := time.Now()
-	binary.LittleEndian.PutUint64(b[0:], uint64(now.Unix()))
-	binary.LittleEndian.PutUint64(b[8:], uint64(now.Nanosecond()/1000))
-	binary.LittleEndian.PutUint16(b[16:], typ)
-	binary.LittleEndian.PutUint16(b[18:], code)
-	binary.LittleEndian.PutUint32(b[20:], uint32(value))
-	if _, err := p.f.Write(b[:]); err != nil {
-		log.Printf("zdalne pióro: zapis: %v", err)
+	if _, err := p.f.Write(encodeInputEvent(time.Now(), typ, code, value)); err != nil {
+		log.Printf("remote pen: write: %v", err)
 	}
 }
 
@@ -107,7 +121,8 @@ func clamp01(v float64) float64 {
 	return v
 }
 
-// apply wykonuje jedną komendę od sesji. Zwraca false, gdy pióro trzyma inna sesja.
+// apply executes one command from a session. It returns false when another
+// session holds the pen.
 func (p *penWriter) apply(owner any, cmd byte, x, y float64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -115,7 +130,7 @@ func (p *penWriter) apply(owner any, cmd byte, x, y float64) bool {
 		return false
 	}
 	if err := p.openLocked(); err != nil {
-		log.Printf("zdalne pióro: %v", err)
+		log.Printf("remote pen: %v", err)
 		return false
 	}
 	p.lastEvent = time.Now()
@@ -140,7 +155,7 @@ func (p *penWriter) apply(owner any, cmd byte, x, y float64) bool {
 		p.touch = true
 	case 'm':
 		if !p.touch {
-			return true // ruch bez przyłożenia ignorujemy (nie ma "najeżdżania")
+			return true // ignore moves while the pen is up (no hover)
 		}
 		p.emitLocked(evAbs, absX, ax)
 		p.emitLocked(evAbs, absY, ay)
@@ -152,7 +167,8 @@ func (p *penWriter) apply(owner any, cmd byte, x, y float64) bool {
 	return true
 }
 
-// liftLocked podnosi i oddala pióro, zwalniając je dla innych sesji.
+// liftLocked lifts the pen and takes it out of range, freeing it for other
+// sessions.
 func (p *penWriter) liftLocked() {
 	if p.f == nil {
 		return
@@ -172,7 +188,7 @@ func (p *penWriter) liftLocked() {
 	p.owner = nil
 }
 
-// release wywoływane, gdy sesja się kończy: nigdy nie zostawiaj przyłożonego pióra.
+// release is called when a session ends: never leave the pen pressed down.
 func (p *penWriter) release(owner any) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -185,14 +201,14 @@ func (p *penWriter) watchdog() {
 	for range time.Tick(500 * time.Millisecond) {
 		p.mu.Lock()
 		if p.touch && time.Since(p.lastEvent) > penStallTimeout {
-			log.Printf("zdalne pióro: brak ruchu od %v, podnoszę", penStallTimeout)
+			log.Printf("remote pen: no movement for %v, lifting", penStallTimeout)
 			p.liftLocked()
 		}
 		p.mu.Unlock()
 	}
 }
 
-// parsePenFrame dzieli ramkę na komendy.
+// parsePenFrame splits a frame into commands.
 func parsePenFrame(frame string, fn func(cmd byte, x, y float64)) {
 	sc := bufio.NewScanner(strings.NewReader(frame))
 	for sc.Scan() {
@@ -214,15 +230,16 @@ func parsePenFrame(frame string, fn func(cmd byte, x, y float64)) {
 	}
 }
 
-// sameOrigin chroni WebSocket przed użyciem z obcej strony (cross-site).
+// sameOrigin protects the WebSocket from being used by another site
+// (cross-site WebSocket hijacking).
 func sameOrigin(cfg *websocket.Config, r *http.Request) error {
 	o := r.Header.Get("Origin")
 	if o == "" {
-		return nil // nie-przeglądarkowy klient; i tak wymaga ciasteczka sesji
+		return nil // non-browser client; still needs the session cookie
 	}
 	u, err := url.Parse(o)
 	if err != nil || u.Host != r.Host {
-		return fmt.Errorf("origin %q nie pasuje do hosta %q", o, r.Host)
+		return fmt.Errorf("origin %q does not match host %q", o, r.Host)
 	}
 	return nil
 }
@@ -231,10 +248,10 @@ func handlePen(pw *penWriter, sw *sleepWatcher) http.Handler {
 	return websocket.Server{
 		Handshake: sameOrigin,
 		Handler: func(ws *websocket.Conn) {
-			session := new(int) // unikalny identyfikator sesji
+			session := new(int) // unique session identity
 			defer pw.release(session)
-			log.Printf("zdalne pióro: sesja otwarta (%s)", clientIP(ws.Request()))
-			defer log.Printf("zdalne pióro: sesja zamknięta")
+			log.Printf("remote pen: session opened (%s)", clientIP(ws.Request()))
+			defer log.Printf("remote pen: session closed")
 			for {
 				var frame string
 				if err := websocket.Message.Receive(ws, &frame); err != nil {

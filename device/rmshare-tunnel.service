@@ -1,5 +1,5 @@
 [Unit]
-Description=rmshare: Cloudflare Tunnel -> proxy :8080
+Description=rmshare: tunnel (Tailscale Funnel / Cloudflare) -> proxy :8080
 After=network-online.target rmshare-proxy.service
 Wants=network-online.target rmshare-proxy.service
 

@@ -1,9 +1,10 @@
-// rmshare — proxy z hasłem przed goMarkableStream.
+// rmshare is a password-protected reverse proxy in front of goMarkableStream.
 //
-// Działa na reMarkable. Wystawia formularz logowania; po podaniu poprawnego
-// hasła ustawia cookie sesji i przepuszcza cały ruch (w tym długotrwały
-// strumień /stream i SSE /events) do goMarkableStream na localhost.
-// Cloudflare Tunnel kieruje ruch z internetu na ten proxy.
+// It runs on the reMarkable itself. It serves a login form; once the correct
+// password is entered it sets a session cookie and forwards all traffic
+// (including the long-lived /stream frame stream and the /events SSE feed) to
+// goMarkableStream on localhost. A tunnel (Tailscale Funnel or Cloudflare
+// Tunnel) exposes this proxy to the internet.
 package main
 
 import (
@@ -26,21 +27,27 @@ import (
 )
 
 // ===========================================================================
-// KONFIGURACJA — zmień hasło tutaj i przebuduj (./deploy.sh)
+// Configuration
 // ===========================================================================
 
-// Password to hasło wpisywane w przeglądarce. Zahardkodowane celowo.
-const Password = "remarkable-live-2026"
+// passwordEnv is the environment variable holding the viewer password. It is
+// normally set in tunnel.env, which the systemd unit loads as an
+// EnvironmentFile. The -password flag takes precedence.
+const passwordEnv = "RMSHARE_PASSWORD"
 
-// SessionTTL mówi, jak długo cookie po zalogowaniu pozostaje ważne.
+// minPasswordLen rejects trivially guessable passwords: the proxy is usually
+// reachable from the public internet.
+const minPasswordLen = 8
+
+// SessionTTL is how long the session cookie stays valid after logging in.
 const SessionTTL = 30 * 24 * time.Hour
 
-// Ochrona przed zgadywaniem hasła: po tylu nieudanych próbach w oknie
-// FailWindow logowanie jest blokowane do końca okna.
+// Brute-force protection: after MaxFailures failed attempts within
+// FailWindow, logging in is blocked until the window has passed.
 const (
 	MaxFailures = 20
 	FailWindow  = 15 * time.Minute
-	FailDelay   = 1500 * time.Millisecond // opóźnienie odpowiedzi po błędnym haśle
+	FailDelay   = 1500 * time.Millisecond // response delay after a wrong password
 )
 
 const cookieName = "rmshare_session"
@@ -54,7 +61,7 @@ var loginTmpl = template.Must(template.New("login").Parse(loginHTML))
 
 type sessionStore struct {
 	mu       sync.Mutex
-	sessions map[string]time.Time // token -> wygaśnięcie
+	sessions map[string]time.Time // token -> expiry
 	failures []time.Time
 }
 
@@ -125,7 +132,7 @@ func (s *sessionStore) revoke(tok string) {
 	s.mu.Unlock()
 }
 
-// locked zwraca true, gdy przekroczono limit nieudanych prób.
+// locked reports whether the failed-attempt limit has been reached.
 func (s *sessionStore) locked() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -147,8 +154,8 @@ func isAuthenticated(r *http.Request, store *sessionStore) bool {
 	return store.valid(c.Value)
 }
 
-// isHTTPS mówi, czy klient połączył się przez HTTPS (bezpośrednio lub przez
-// Cloudflare Tunnel, który ustawia X-Forwarded-Proto).
+// isHTTPS reports whether the client connected over HTTPS (directly or through
+// a tunnel that sets X-Forwarded-Proto).
 func isHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
@@ -167,19 +174,27 @@ func clientIP(r *http.Request) string {
 }
 
 func main() {
-	listen := flag.String("listen", ":8080", "adres nasłuchu proxy")
-	upstream := flag.String("upstream", "http://127.0.0.1:2011", "adres goMarkableStream")
-	urlFile := flag.String("urlfile", "/home/root/rmshare/tunnel-url.txt", "plik z aktualnym publicznym adresem tunelu")
-	publishDoc := flag.Bool("doc", false, "po zmianie adresu zapisz PDF z adresem i QR w bibliotece tabletu (restartuje xochitl)")
-	xochitlDir := flag.String("xochitl-dir", "/home/root/.local/share/remarkable/xochitl", "katalog dokumentów xochitl")
-	sleepWatch := flag.Bool("sleep-watch", true, "śledź stan wyświetlacza w journalu xochitl i blokuj streaming, gdy tablet śpi")
-	penDevice := flag.String("pen-device", "/dev/input/event2", "urządzenie pióra do zdalnego rysowania z przeglądarki (\"\" = wyłączone)")
-	notifyLight := flag.String("notify-light", "/sys/class/backlight/rm_frontlight", "podświetlenie do sygnalizowania widzów mrugnięciem (\"\" = wyłączone)")
+	listen := flag.String("listen", ":8080", "address the proxy listens on")
+	upstream := flag.String("upstream", "http://127.0.0.1:2011", "goMarkableStream address")
+	password := flag.String("password", "", "viewer password (default: $"+passwordEnv+")")
+	urlFile := flag.String("urlfile", "/home/root/rmshare/tunnel-url.txt", "file holding the current public tunnel URL")
+	publishDoc := flag.Bool("doc", false, "when the URL changes, save a PDF with the URL and a QR code to the tablet's library (restarts xochitl)")
+	xochitlDir := flag.String("xochitl-dir", "/home/root/.local/share/remarkable/xochitl", "xochitl document directory")
+	sleepWatch := flag.Bool("sleep-watch", true, "follow the display state in the xochitl journal and block streaming while the tablet sleeps")
+	penDevice := flag.String("pen-device", "/dev/input/event2", "pen input device for remote drawing from the browser (\"\" = disabled)")
+	notifyLight := flag.String("notify-light", "/sys/class/backlight/rm_frontlight", "front light used to signal viewers by blinking (\"\" = disabled)")
 	flag.Parse()
+
+	if *password == "" {
+		*password = os.Getenv(passwordEnv)
+	}
+	if len(*password) < minPasswordLen {
+		log.Fatalf("set a viewer password of at least %d characters with -password or $%s (e.g. in tunnel.env)", minPasswordLen, passwordEnv)
+	}
 
 	target, err := url.Parse(*upstream)
 	if err != nil {
-		log.Fatalf("zły adres upstream: %v", err)
+		log.Fatalf("invalid upstream URL: %v", err)
 	}
 
 	store := newSessionStore()
@@ -195,15 +210,15 @@ func main() {
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.Out.Host = target.Host
-			// Nie przekazujemy cookie sesji dalej — upstream go nie potrzebuje.
+			// Do not forward the session cookie: the upstream does not need it.
 			pr.Out.Header.Del("Cookie")
 		},
-		// -1: każdy fragment odpowiedzi wypychany natychmiast. Konieczne dla
-		// strumienia klatek (/stream) i SSE (/events).
+		// -1: flush every chunk of the response immediately. Required for the
+		// frame stream (/stream) and SSE (/events).
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("upstream error %s %s: %v", r.Method, r.URL.Path, err)
-			http.Error(w, "Strumień z reMarkable jest niedostępny (goMarkableStream nie odpowiada).", http.StatusBadGateway)
+			http.Error(w, "The reMarkable stream is unavailable (goMarkableStream is not responding).", http.StatusBadGateway)
 		},
 	}
 
@@ -220,19 +235,19 @@ func main() {
 			renderLogin(w, "", http.StatusOK)
 		case http.MethodPost:
 			if store.locked() {
-				renderLogin(w, "Za dużo nieudanych prób. Spróbuj ponownie za kilkanaście minut.", http.StatusTooManyRequests)
+				renderLogin(w, "Too many failed attempts. Try again in a few minutes.", http.StatusTooManyRequests)
 				return
 			}
 			if err := r.ParseForm(); err != nil {
-				renderLogin(w, "Nieprawidłowe żądanie.", http.StatusBadRequest)
+				renderLogin(w, "Invalid request.", http.StatusBadRequest)
 				return
 			}
 			given := r.PostFormValue("password")
-			if subtle.ConstantTimeCompare([]byte(given), []byte(Password)) != 1 {
+			if subtle.ConstantTimeCompare([]byte(given), []byte(*password)) != 1 {
 				store.recordFailure()
-				log.Printf("błędne hasło z %s", clientIP(r))
+				log.Printf("wrong password from %s", clientIP(r))
 				time.Sleep(FailDelay)
-				renderLogin(w, "Nieprawidłowe hasło.", http.StatusUnauthorized)
+				renderLogin(w, "Wrong password.", http.StatusUnauthorized)
 				return
 			}
 			tok, err := store.create()
@@ -249,7 +264,7 @@ func main() {
 				Secure:   isHTTPS(r),
 				SameSite: http.SameSiteLaxMode,
 			})
-			log.Printf("zalogowano z %s", clientIP(r))
+			log.Printf("logged in from %s", clientIP(r))
 			http.Redirect(w, r, "/", http.StatusSeeOther)
 		default:
 			w.Header().Set("Allow", "GET, POST")
@@ -282,17 +297,18 @@ func main() {
 		Addr:              *listen,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		// Brak WriteTimeout/IdleTimeout: /stream i /events żyją długo.
+		// No WriteTimeout/IdleTimeout: /stream and /events are long-lived.
 	}
-	log.Printf("rmshare: nasłuch na %s, upstream %s", *listen, target)
+	log.Printf("rmshare: listening on %s, upstream %s", *listen, target)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Println(err)
 		os.Exit(1)
 	}
 }
 
-// requireAuth przepuszca tylko żądania z ważną sesją. Nawigacja przeglądarki
-// bez sesji trafia na formularz; wywołania API/fetch dostają 401.
+// requireAuth only lets requests with a valid session through. Browser
+// navigation without a session is redirected to the login form; API/fetch
+// calls get a 401.
 func requireAuth(store *sessionStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !isAuthenticated(r, store) {

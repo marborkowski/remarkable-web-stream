@@ -1,12 +1,13 @@
 [Unit]
-Description=rmshare: proxy z haslem przed goMarkableStream
+Description=rmshare: password-protected proxy in front of goMarkableStream
 After=rmshare-stream.service
 Wants=rmshare-stream.service
 
 [Service]
 Type=simple
-# PUBLISH_DOC=1: po kazdej zmianie adresu tunelu zapisuje PDF z adresem i QR
-# w bibliotece tabletu (restartuje xochitl). Nadpisz w /home/root/rmshare/tunnel.env.
+# PUBLISH_DOC=1: whenever the tunnel URL changes, save a PDF with the URL and a QR code
+# to the tablet's library (restarts xochitl). Override in /home/root/rmshare/tunnel.env,
+# which also provides RMSHARE_PASSWORD.
 Environment=PUBLISH_DOC=1
 EnvironmentFile=-/home/root/rmshare/tunnel.env
 ExecStart=/home/root/rmshare/rmshare -listen :8080 -upstream http://127.0.0.1:2011 -urlfile /home/root/rmshare/tunnel-url.txt -doc=${PUBLISH_DOC}

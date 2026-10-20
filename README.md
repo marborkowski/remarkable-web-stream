@@ -1,275 +1,268 @@
-# reMarkable Live — podgląd ekranu przez przeglądarkę (Cloudflare Tunnel)
+# reMarkable Live
 
-Otwierasz adres WWW z dowolnego komputera, wpisujesz hasło i widzisz na żywo to,
-co rysujesz na reMarkable. Wszystko działa **na samym tablecie** jako trzy usługi
-systemd; Mac jest potrzebny tylko do wdrożenia.
+**Watch your reMarkable screen live in any web browser, from anywhere, behind a password. Everything runs on the tablet itself.**
+
+Open a URL on any computer or phone, type the password, and see what you write and draw on the tablet in real time. Viewers can even draw back onto the tablet. You need a computer only to deploy it. After that, the tablet runs the whole thing as three systemd services.
+
+> [!WARNING]
+> **This is an experimental hobby project.** It modifies a device you rely on, runs as `root`, and makes your tablet's screen reachable from the public internet. Read [Security considerations](#security-considerations) before you use it, and use it at your own risk. It is provided **as is, without any warranty**. The author is not liable for any damage, data loss or security incident caused by using it (see [Disclaimer](#disclaimer) and [LICENSE](LICENSE)).
+
+---
+
+## Contents
+
+- [Features](#features)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Choosing a tunnel](#choosing-a-tunnel)
+- [Finding the current URL](#finding-the-current-url)
+- [Using the viewer](#using-the-viewer)
+- [Configuration](#configuration)
+- [Operating the services](#operating-the-services)
+- [Troubleshooting](#troubleshooting)
+- [Security considerations](#security-considerations)
+- [Project layout](#project-layout)
+- [Development](#development)
+- [Credits](#credits)
+- [Disclaimer](#disclaimer)
+- [License](#license)
+
+## Features
+
+- **Live screen in the browser.** The tablet's framebuffer is streamed with WebGL rendering and delta-encoded frames, courtesy of [goMarkableStream](https://github.com/owulveryck/goMarkableStream).
+- **Password protection.** A small Go reverse proxy (`rmshare`) handles the login form, session cookies and brute-force throttling.
+- **Reachable from anywhere.** You can use [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) (a stable URL, free, no domain needed), a Cloudflare quick tunnel (no account at all), or a Cloudflare named tunnel (your own domain).
+- **Draw from the browser.** You can draw on the tablet with a mouse, finger or stylus. Strokes are injected as real pen events, so they use the tool currently selected on the tablet.
+- **Auto-rotate.** The preview follows the tablet's orientation within a fraction of a second.
+- **Sleep-aware.** When the tablet's display goes to sleep, streams are cut off and the page shows "The tablet is asleep". It recovers by itself on wake-up.
+- **"Someone is watching" signal.** The front light blinks twice when a viewer connects and once, longer, when the last viewer leaves.
+- **URL on the tablet.** With a quick tunnel the URL changes on restart. The proxy can put a pinned PDF with the current URL and a QR code into your library.
+- **Several viewers at once** (up to 3 concurrent streams).
+- **Self-healing tunnel.** A watchdog replaces a Cloudflare quick tunnel that died during a long offline period.
+
+## How it works
 
 ```
-przeglądarka ──HTTPS──> Cloudflare ──tunel──> cloudflared (na rM)
-                                                 │ http://127.0.0.1:8080
-                                                 ▼
-                                      rmshare (proxy, formularz hasła, cookie sesji)
-                                                 │ http://127.0.0.1:2011
-                                                 ▼
-                                      goMarkableStream (czyta framebuffer, strumień klatek + UI)
+browser ──HTTPS──▶ tunnel (Tailscale Funnel / Cloudflare) ──▶ tunnel client on the reMarkable
+                                                                   │ http://127.0.0.1:8080
+                                                                   ▼
+                                     rmshare (Go proxy: login form, session cookie,
+                                              sleep/orientation watcher, remote pen,
+                                              viewer signal, URL document)
+                                                                   │ http://127.0.0.1:2011
+                                                                   ▼
+                                     goMarkableStream (patched; reads the framebuffer
+                                                       from xochitl's memory, serves the
+                                                       frame stream and the web UI)
 ```
 
-* **goMarkableStream** (gotowy projekt, [owulveryck/goMarkableStream](https://github.com/owulveryck/goMarkableStream))
-  robi całą ciężką robotę: czyta ekran z pamięci `xochitl` i serwuje stronę z podglądem WebGL.
-  Uruchamiany tylko na `127.0.0.1`, z wyłączonym własnym logowaniem (`-unsafe`, `RK_JWT_ENABLED=false`),
-  więc z zewnątrz nie da się go dosięgnąć inaczej niż przez proxy.
-  Budowany ze źródeł z własną łatką (`gms/pointer_arm64.patch`): oryginalne wykrywanie bufora ekranu
-  na Paper Pro działa tylko po zimnym starcie, a po restarcie `xochitl` zawieszało się w pętli;
-  łatka szuka bufora deterministycznie: skanuje mapowania pamięci xochitl w poszukiwaniu chunku malloc
-  o rozmiarze klatki, którego zawartość wygląda jak nieprzezroczysty obraz BGRA; stara metoda zostaje jako zapas.
-* **rmshare** (`proxy/main.go`, własny kod w Go) stoi przed nim: bez ważnego cookie pokazuje formularz hasła,
-  po zalogowaniu przepuszcza cały ruch, w tym długie odpowiedzi `/stream` i SSE `/events`.
-  Hasło jest **zahardkodowane w stałej `Password`** w `proxy/main.go`.
-* **cloudflared** wystawia proxy do internetu. Bez konta Cloudflare dostajesz losowy adres
-  `*.trycloudflare.com` (zmienia się po restarcie); z kontem i domeną — stały adres.
+| Service | Binary | Role |
+| --- | --- | --- |
+| `rmshare-stream` | `gomarkablestream` | Upstream [goMarkableStream](https://github.com/owulveryck/goMarkableStream) built from source with [our patches](gms/). Bound to `127.0.0.1` only, with its own authentication disabled, so it can be reached only through the proxy. |
+| `rmshare-proxy` | `rmshare` ([`proxy/`](proxy/)) | Password gate and reverse proxy on `:8080`, plus all the extras: sleep and orientation detection from the xochitl journal, the remote pen WebSocket, the front-light signal and the URL document. |
+| `rmshare-tunnel` | `cloudflared` or `tailscaled` | Publishes the proxy to the internet ([`device/run-tunnel.sh`](device/run-tunnel.sh)). |
 
-## Wymagania
+For the details of each feature and of each patch, see [docs/how-it-works.md](docs/how-it-works.md).
 
-* reMarkable 2 lub Paper Pro z trybem deweloperskim i SSH (`root@10.11.99.1` przez USB).
-* Na Macu: `go`, `curl`, `patch`, `ssh`. Klucz SSH na urządzeniu — jednorazowo:
+## Requirements
+
+**Tablet**
+- A **reMarkable Paper Pro** (tested on firmware 6.0.106). The **reMarkable 2** should work (goMarkableStream supports it and the build targets 32-bit ARM), but it has **not been tested**. Remote drawing and the front-light signal in particular assume Paper Pro devices and value ranges.
+- **Developer mode** enabled, with SSH access as `root` (over USB at `10.11.99.1`, or over Wi-Fi).
+
+**Computer used for deployment** (macOS or Linux)
+- [Go](https://go.dev/dl/) 1.26 or newer (required to build goMarkableStream v1.4.0), plus `curl`, `patch`, `tar` and `ssh`.
+- An SSH key installed on the tablet (one-time setup). The root password is shown on the tablet under *Settings → Help → Copyrights and licenses* (GPLv3 section):
   ```bash
   ssh-copy-id root@10.11.99.1
   ```
-  (hasło roota znajdziesz na tablecie: Settings → Help → Copyrights and licenses, sekcja GPLv3.)
 
-## Szybki start (quick tunnel, bez konta Cloudflare)
+## Quick start
 
-1. Zmień hasło: w `proxy/main.go` edytuj `const Password = "..."` (obecnie `remarkable-live-2026`).
-   Hasło celowo **nie** jest drukowane w dokumencie z QR na tablecie.
-2. Wdróż:
+1. **Clone this repository** and create your configuration:
    ```bash
-   ./deploy.sh
+   cp tunnel.env.example tunnel.env
    ```
-   Skrypt wykrywa architekturę tabletu, buduje proxy i goMarkableStream (ze źródeł, z łatką),
-   pobiera cloudflared, kopiuje wszystko do `/home/root/rmshare/` i włącza usługi. Na końcu wypisuje `ADRES: https://xxxx.trycloudflare.com`.
-3. Otwórz adres, wpisz hasło. W menu podglądu (ikona ⚙) możesz przełączyć orientację itp.
+2. **Set a strong password** in `tunnel.env`:
+   ```bash
+   RMSHARE_PASSWORD=<long random string, e.g. from: openssl rand -base64 18>
+   ```
+   Optionally pick a tunnel mode (see [Choosing a tunnel](#choosing-a-tunnel)). If you set nothing else, a Cloudflare quick tunnel is used.
+3. **Connect the tablet over USB and deploy:**
+   ```bash
+   ./deploy.sh                    # or: ./deploy.sh root@<tablet-ip>
+   ```
+   The script detects the tablet's architecture and builds the proxy. It builds goMarkableStream from source with the patches, then downloads cloudflared (and Tailscale in Funnel mode). Finally it uploads everything to `/home/root/rmshare/` and enables the services. At the end it prints the URL:
+   ```
+   URL: https://something-random.trycloudflare.com
+   ```
+4. **Open the URL, enter the password** and watch.
 
-## Gdzie znaleźć aktualny adres (quick tunnel zmienia go po każdym restarcie)
+Downloaded and built artifacts are cached in `dist/`. Delete `dist/` (or the relevant files in it) to force a fresh build or download.
 
-1. **Na ekranie tabletu**: po każdej zmianie adresu proxy zapisuje w bibliotece dokument
-   **„reMarkable Live – adres”** (przypięty, w Ulubionych) z adresem i kodem QR — zeskanuj go
-   telefonem albo przepisz. Żeby tablet zobaczył nowy dokument, proxy restartuje `xochitl`
-   (ok. 10 s, zaraz po uruchomieniu tunelu). Jeśli tego nie chcesz, wpisz w `tunnel.env`
-   `PUBLISH_DOC=0`; adres nadal będzie w pozostałych miejscach.
-2. **Lokalnie w przeglądarce**: `http://10.11.99.1:8080/url` (USB) lub
-   `http://<IP-tabletu>:8080/url` — po zalogowaniu strona z adresem i QR;
-   `.../url?format=txt` daje sam adres.
-3. **Przez SSH**:
+## Choosing a tunnel
+
+| Mode | URL | Account needed | Notes |
+| --- | --- | --- | --- |
+| **Tailscale Funnel** (recommended) | stable `https://<name>.<tailnet>.ts.net` | free Tailscale account | No domain needed. TLS terminates on the tablet. |
+| **Cloudflare quick tunnel** (default) | random `*.trycloudflare.com`, changes on every restart | none | Easiest way to try it out. The URL is published to the tablet (see below). |
+| **Cloudflare named tunnel** | your own hostname | Cloudflare account and a domain | Stable. You can add Cloudflare Access in front of it as a second login layer. |
+
+You can find setup steps for each mode, and a comparison with alternatives such as ngrok or plain Tailscale, in **[docs/tunnels.md](docs/tunnels.md)**.
+
+## Finding the current URL
+
+A quick-tunnel URL changes whenever the tunnel restarts. You can always find the current one in any of these places:
+
+1. **On the tablet.** A pinned document called **"reMarkable Live – URL"** (in Favourites) shows the URL and a QR code. To make the tablet notice the new document, the proxy restarts `xochitl` (about 10 s). Set `PUBLISH_DOC=0` in `tunnel.env` to disable this. The password is never printed in that document.
+2. **In a browser on the local network.** Open `http://10.11.99.1:8080/url` (USB) or `http://<tablet-ip>:8080/url`, log in, and you get the URL and a QR code. Add `?format=txt` for plain text.
+3. **Over SSH:**
    ```bash
    ssh root@10.11.99.1 cat /home/root/rmshare/tunnel-url.txt
    ```
 
-### Watchdog tunelu
+## Using the viewer
 
-Quick tunnel po dłuższym braku sieci (tablet na baterii w suspendzie przez kilka godzin) jest
-kasowany po stronie Cloudflare, a cloudflared w nieskończoność próbuje go zarejestrować
-(`Unauthorized: Tunnel not found`) zamiast założyć nowy. `run-tunnel.sh` wykrywa to po logu
-i po endpointcie `/ready` cloudflared (503 przez 2 min mimo działającego internetu), kasuje
-stary adres, ubija cloudflared i kończy się — systemd uruchamia świeży tunel, nowy adres
-trafia do dokumentu na tablecie. Próg: `TUNNEL_DEAD_AFTER=120` (sekundy) w `tunnel.env`.
+The viewer is goMarkableStream's web UI with a few additions in the left-hand menu:
 
-## Stały adres bez domeny: Tailscale Funnel (zalecane)
+| Button | Key | What it does |
+| --- | --- | --- |
+| **Auto-rotate** | `A` | Follow the tablet's orientation (on by default; the choice is remembered). A manual **Rotate** (`R`) turns auto-rotate off. |
+| **Draw** | `D` | Turn the preview into a drawing surface. Strokes go to the tablet with a fixed 50% pressure and the tool currently selected on the tablet (pen, marker, eraser, …). Only one person can draw at a time. |
 
-1. Załóż darmowe konto na [tailscale.com](https://tailscale.com) (logowanie Google/GitHub/e‑mail).
-2. W katalogu projektu utwórz `tunnel.env` (jest w `.gitignore`):
-   ```
-   TUNNEL=tailscale
-   TS_HOSTNAME=remarkable
-   ```
-   Opcjonalnie `TS_AUTHKEY=tskey-auth-...` (Settings → Keys → Generate auth key; zaznacz
-   *Reusable*), wtedy tablet loguje się sam. Bez klucza skrypt wypisze link do zalogowania.
-3. `./deploy.sh` — skrypt pobierze binarki Tailscale (`tailscaled` w trybie userspace, bo
-   reMarkable nie ma `/dev/net/tun`) i wgra je na tablet. Na końcu wypisze:
-   * `ZALOGUJ URZADZENIE W TAILSCALE: https://login.tailscale.com/a/...` — otwórz, zatwierdź;
-   * `WLACZ FUNNEL W TAILSCALE: https://login.tailscale.com/f/funnel?...` — otwórz, zatwierdź
-     (jednorazowo dodaje atrybut `funnel` do polityki tailnetu). Włącz też
-     **DNS → HTTPS Certificates** w konsoli, jeśli nie jest włączone.
-4. Po chwili pojawi się `ADRES: https://remarkable.<tailnet>.ts.net` — stały, trafia też do
-   dokumentu na tablecie. Publiczny rekord DNS dla tej nazwy Tailscale tworzy dopiero po
-   włączeniu Funnel i propagacja trwa od kilku do kilkunastu minut (do tego czasu przeglądarka
-   zgłosi „nie znaleziono serwera”). Pierwsze wejście może potrwać kilkanaście sekund
-   (wystawienie certyfikatu Let's Encrypt).
+Other behaviour to know about:
+- **Sleep.** While the tablet sleeps, the page shows *"The tablet is asleep"* and checks every 5 s. When the tablet cannot be reached, it shows *"Cannot reach the tablet"* and keeps retrying indefinitely.
+- **Viewer signal.** The front light blinks **twice** about 2 s after the first viewer connects. It blinks **once, longer** about 15 s after the last viewer leaves. With a bright light the blink dims it; with a dim or off light the blink brightens it. Your brightness is always restored.
+- **Log out** by visiting `/logout`.
 
-Szczegóły działania (`device/run-tunnel.sh`, tryb `tailscale`): `tailscaled` dostaje `--statedir`
-(bez niego nie ma gdzie trzymać certyfikatów i Funnel zwraca „no TailscaleVarRoot”);
-`tailscale up` uruchamiane jest tylko raz, bo każde kolejne unieważnia poprzedni link logowania;
-`tailscale funnel` wywoływane jest z limitem czasu, bo bez włączonego Funnel czeka w nieskończoność.
+## Configuration
 
-Stan można sprawdzić przez SSH: `/home/root/rmshare/tailscale --socket=/home/root/rmshare/tailscale-state/tailscaled.sock status`.
-Linki do zalogowania / włączenia Funnel są też w `/home/root/rmshare/tailscale-login-url.txt`
-i `tailscale-funnel-url.txt`, dopóki są potrzebne.
+Most settings live in **`tunnel.env`** (see [`tunnel.env.example`](tunnel.env.example)):
 
-## Stały adres (tunel nazwany, konto Cloudflare + domena)
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RMSHARE_PASSWORD` | *(required)* | Viewer password, at least 8 characters. |
+| `TUNNEL` | *(unset)* | Set to `tailscale` for Tailscale Funnel. |
+| `TS_HOSTNAME` | `remarkable` | Tailscale machine name, which becomes part of the URL. |
+| `TS_AUTHKEY` | *(unset)* | Optional Tailscale auth key for unattended login. |
+| `TUNNEL_TOKEN` | *(unset)* | Cloudflare named tunnel token. |
+| `PUBLIC_URL` | *(unset)* | URL shown on `/url` and in the tablet document for named tunnels. |
+| `PUBLISH_DOC` | `1` | Publish the URL document to the tablet's library (restarts xochitl). |
+| `TUNNEL_DEAD_AFTER` | `120` | Seconds before the watchdog restarts a stuck Cloudflare tunnel. |
 
-1. W [Cloudflare Zero Trust](https://one.dash.cloudflare.com) → Networks → Tunnels → **Create a tunnel**
-   (typ Cloudflared), nazwij np. `remarkable`.
-2. Skopiuj token z komendy instalacyjnej (fragment po `--token`).
-3. W zakładce **Public Hostname** dodaj np. `rm.twojadomena.pl` → Service `HTTP`, URL `localhost:8080`.
-4. Na Macu, w katalogu projektu, utwórz plik `tunnel.env` (jest w `.gitignore`):
-   ```
-   TUNNEL_TOKEN=eyJhIjoi...
-   ```
-   Opcjonalnie dopisz `PUBLIC_URL=https://rm.twojadomena.pl`, żeby ten adres też pojawił się
-   w `/url` i w dokumencie na tablecie.
-5. `./deploy.sh` — skrypt `run-tunnel.sh` na urządzeniu wykryje token i użyje tunelu nazwanego.
+The proxy itself has command-line flags. Change them in [`device/rmshare-proxy.service`](device/rmshare-proxy.service):
 
-Alternatywnie możesz położyć w katalogu `cloudflared/` własny `config.yml` + plik credentials
-(z `cloudflared tunnel create`); `run-tunnel.sh` użyje ich, gdy nie ma `tunnel.env`.
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-listen` | `:8080` | Listen address. |
+| `-upstream` | `http://127.0.0.1:2011` | goMarkableStream address. |
+| `-password` | `$RMSHARE_PASSWORD` | Viewer password. |
+| `-urlfile` | `/home/root/rmshare/tunnel-url.txt` | File holding the current public URL. |
+| `-doc` | `false` | Publish the URL document (the unit passes `${PUBLISH_DOC}`). |
+| `-xochitl-dir` | `/home/root/.local/share/remarkable/xochitl` | xochitl document directory. |
+| `-sleep-watch` | `true` | Follow sleep and orientation in the xochitl journal. |
+| `-pen-device` | `/dev/input/event2` | Pen input device for remote drawing (`""` disables it). |
+| `-notify-light` | `/sys/class/backlight/rm_frontlight` | Front light for the viewer signal (`""` disables it). |
 
-Dodatkowo możesz w Cloudflare włączyć Access (logowanie e-mailem) przed hostem —
-wtedy masz dwie warstwy: Cloudflare Access + hasło w proxy.
+The component versions are pinned in [`deploy.sh`](deploy.sh). You can override them with environment variables: `GMS_VERSION` (goMarkableStream, default `v1.4.0`), `CF_VERSION` (cloudflared) and `TS_VERSION` (Tailscale). The patches target goMarkableStream `v1.4.0`, so other versions may need patch updates.
 
-## Uśpienie tabletu
-
-Paper Pro podłączony do USB nie wchodzi w prawdziwy suspend (ładowarka trzyma blokadę
-wybudzenia), więc po uśpieniu ekranu procesy i Wi‑Fi dalej działają. Żeby nikt nie oglądał
-„uśpionego” tabletu, proxy śledzi w journalu xochitl komunikat
-`Changing display state from Normal to DeepSleep` (i z powrotem):
-
-* w chwili uśpienia zrywa aktywne strumienie i zdarzenia pióra, a kolejne żądania
-  `/stream`, `/screenshot`, `/events`, `/gestures` dostają **503**;
-* strona (łatka `gms/client_sleep.patch`) zasłania ostatnią klatkę nakładką „Tablet jest uśpiony”
-  i co 5 s sprawdza, czy tablet się obudził — po wybudzeniu obraz wraca sam;
-* przy utracie połączenia (tablet na baterii w suspendzie, brak Wi‑Fi) nakładka pokazuje
-  „Brak połączenia z tabletem” i strona ponawia próby bez końca.
-
-Stan można sprawdzić po zalogowaniu pod `/state` (JSON `{"awake":true|false}`).
-Wyłączenie: `-sleep-watch=false` w `device/rmshare-proxy.service`.
-
-## Alternatywy dla Cloudflare (ocena)
-
-* **ngrok (darmowy)** — odpada do streamingu ekranu: limit **1 GB transferu wychodzącego
-  na miesiąc** (to rzędu kilku godzin oglądania), do tego ngrok wstawia stronę pośrednią
-  (interstitial) przed każdą sesją przeglądarki na darmowym planie. Zaletą byłaby stała
-  subdomena `*.ngrok-free.app`.
-* **Cloudflare, tunel nazwany** — ta sama infrastruktura co quick tunnel (więc ta sama
-  wydajność), ale stały adres i brak problemu z kasowaniem tunelu po dłuższym offline.
-  Wymaga konta i własnej domeny.
-* **Tailscale Funnel** (wdrożone, patrz wyżej) — darmowy, stały adres `*.ts.net`, nie wymaga
-  domeny. Ruch idzie przez relaye Tailscale, TLS kończy się na tablecie.
-* **Tailscale bez Funnel** (komputer widza też w tailnecie) — najlepsza wydajność, bo
-  połączenie WireGuard jest bezpośrednie i nic nie pośredniczy; adres stały; ale nie
-  otworzysz podglądu z dowolnego komputera bez zainstalowanego Tailscale.
-
-Zanim zmienisz tunel, porównaj płynność lokalnie (`http://10.11.99.1:8080` po USB) z tunelem.
-Jeśli lokalnie jest płynnie, a przez tunel nie — winny jest pośrednik; jeśli oba są podobne,
-ogranicza Wi‑Fi tabletu lub samo kodowanie klatek.
-
-## Automatyczny obrót podglądu
-
-Bufor ekranu tabletu jest zawsze w pionie, a xochitl obraca w nim interfejs, gdy obrócisz
-tablet. Proxy czyta z logu xochitl linie `Setting new orientation Landscape` (i pozostałe:
-`Portrait`, `InvertedLandscape`, `InvertedPortrait`) i podaje bieżącą orientację w `/state`.
-Strona (łatka `gms/client_orientation.patch`) odpytuje `/state?wait=<wersja>` w trybie
-long-poll: żądanie czeka do 25 s i wraca od razu po zmianie, więc obrót widać po ułamku sekundy,
-a w spoczynku ruch to jedno małe żądanie na 25 s.
-
-* Przycisk **Auto-rotate** w lewym menu (skrót **A**) włącza/wyłącza śledzenie; domyślnie
-  włączone, wybór zapamiętuje przeglądarka.
-* Ręczne kliknięcie **Rotate** (skrót **R**) wyłącza Auto-rotate, żeby nie walczyć z wyborem
-  użytkownika.
-* Mapowanie orientacji na widok jest w tablicy `ORIENTATION_VIEWS` (łatka
-  `gms/client_orientation.patch`). Na Paper Pro `Landscape` = obrót 90° + odwrócenie,
-  `InvertedLandscape` = sam obrót 90°.
-* Nowy obrót jest nakładany razem z pierwszą klatką, w której obraz faktycznie się zmienił
-  (awaryjnie po 2 s), żeby nigdy nie obracać starego obrazu.
-* Uwaga: xochitl sam obraca ekran, gdy czujnik wykryje przechylenie, także w trakcie pisania
-  na kolanach. Podgląd wiernie to odtwarza; jeśli przeszkadza, zablokuj obrót na tablecie.
-
-## Odświeżanie obrazu bez pióra
-
-Oryginalny goMarkableStream wysyła klatki tylko podczas pisania lub dotyku i zasypia 2 s
-po ostatnim ruchu. Zmiany, które xochitl robi sam (dokument doładowuje się po kilku
-sekundach, obrót, przejście ekranu), docierały więc dopiero przy następnym pociągnięciu
-piórem. Łatka `gms/stream_idle_refresh.patch` sprawia, że w spoczynku strumień nadal
-sprawdza ekran co 0,5 s; niezmieniona klatka to kilkubajtowa pusta delta. Koszt: ok. 15–20%
-jednego rdzenia (z czterech) na czas oglądania, gdy nikt nie pisze; bez otwartego podglądu
-strumień nie działa w ogóle.
-
-## Rysowanie na tablecie z przeglądarki (zdalne pióro)
-
-Przycisk **Draw** w lewym menu (skrót **D**) zamienia podgląd w powierzchnię do rysowania
-myszą, palcem lub rysikiem. Ruchy są przeliczane na natywne współrzędne tabletu (z
-uwzględnieniem obrotu podglądu) i wysyłane przez WebSocket `/pen` do proxy, które wstrzykuje
-je jako zdarzenia pióra do `/dev/input/event2`. xochitl czyta to urządzenie bezpośrednio,
-więc rysuje **narzędziem aktualnie wybranym na tablecie** (pióro, marker, gumka…).
-
-* Nacisk jest stały: 50% (`penPressureFraction` w `proxy/pen.go`).
-* Naraz rysuje jedna osoba; zerwane połączenie lub 1,5 s bez ruchu zawsze podnosi pióro.
-* Gdy tablet śpi, zdarzenia są odrzucane.
-* WebSocket przyjmuje tylko połączenia z tej samej strony (sprawdzanie `Origin`) i wymaga
-  zalogowania.
-* Wyłączenie: `-pen-device=` w `device/rmshare-proxy.service`.
-* Diagnostyka: `tools/pentool` (`info` — zakresy osi, `record` — zrzut zdarzeń z pióra,
-  `line` — testowa kreska).
-
-## Sygnał na tablecie: ktoś ogląda
-
-xochitl nie ma lokalnego API powiadomień (jego pasek powiadomień zasila tylko chmura
-reMarkable), a pikseli dopisanych z zewnątrz e-ink nie odświeży. Proxy sygnalizuje więc
-widzów **mrugnięciem podświetlenia** (front light) i zawsze przywraca Twój poziom jasności:
-
-* **dwa krótkie mrugnięcia** — pierwszy widz połączył się ze strumieniem (po 2 s trwania
-  połączenia, więc przypadkowe odświeżenie strony nie mruga); można zaczynać,
-* **jedno długie mrugnięcie** — ostatni widz odszedł (po 15 s bez widzów, żeby chwilowe
-  zerwania nie mrugały).
-
-Przy jasnym podświetleniu mrugnięcie to przygaszenie, przy ciemnym lub wyłączonym —
-rozjaśnienie. Gdy tablet śpi, nic nie mruga. Liczba aktywnych widzów jest w `/state`
-(pole `viewers`). Wyłączenie: `-notify-light=` w `device/rmshare-proxy.service`.
-
-## Obsługa na urządzeniu
+## Operating the services
 
 ```bash
 ssh root@10.11.99.1
 systemctl status rmshare-stream rmshare-proxy rmshare-tunnel
 journalctl -u rmshare-stream -u rmshare-proxy -u rmshare-tunnel -f
-sh /home/root/rmshare/uninstall.sh        # wyłącza i usuwa usługi
+curl -s localhost:8080/healthz                # "ok" when the proxy is up
+sh /home/root/rmshare/uninstall.sh            # stop and remove the services
+rm -rf /home/root/rmshare                     # ...and delete all files
 ```
 
-Podgląd działa też lokalnie bez tunelu: `http://10.11.99.1:8080` (USB) lub
-`http://<IP-tabletu-w-Wi-Fi>:8080` — również za hasłem.
+The viewer also works locally without any tunnel, still behind the password: `http://10.11.99.1:8080` (USB) or `http://<tablet-ip>:8080` (Wi-Fi).
 
-## Uwagi
+**After a reMarkable software update.** Updates replace `/etc/systemd/system`, but `/home/root` survives. Re-install the services with:
 
-* **Aktualizacja systemu reMarkable** nadpisuje `/etc/systemd/system`, ale zostawia `/home/root`.
-  Po aktualizacji wystarczy `ssh root@10.11.99.1 'sh /home/root/rmshare/install.sh'` (lub `./deploy.sh`).
-* Sesje logowania trzymane są w pamięci proxy: restart usługi/tabletu = ponowne wpisanie hasła.
-  Czas ważności cookie: 30 dni (`SessionTTL`).
-* Ochrona przed zgadywaniem: 1,5 s opóźnienia po błędnym haśle, blokada po 20 błędach w 15 minut.
-* Zużycie zasobów na rM2: goMarkableStream ok. 20–40 MB RAM, cloudflared ok. 30–50 MB; nie zauważysz.
-* Strumień klatek idzie przez Cloudflare jako zwykła odpowiedź HTTP chunked — działa na darmowym planie.
-  Przy dłuższej bezczynności przeglądarka może zerwać SSE zdarzeń pióra; klient sam się łączy ponownie.
-* Wersje: goMarkableStream `v1.4.0`, cloudflared `2026.10.1` (zmienne `GMS_VERSION`, `CF_VERSION` w `deploy.sh`).
-* Oryginalny goMarkableStream obsługuje **jednego widza naraz** (drugi dostaje 429, a klient
-  pokazuje „Rate limited” na stałe). Łatka `gms/stream_preempt.patch` daje każdemu połączeniu
-  własny enkoder delta i dopuszcza **3 równoczesnych widzów** (np. karta lokalna + karta przez
-  tunel); dopiero czwarty przejmuje strumień, zrywając pozostałe. Bez tego dwie otwarte karty
-  odbierały sobie strumień co 1–2 s („reconnect co kilka sekund”).
-* „Bad gateway 502” po zalogowaniu oznacza, że goMarkableStream nie działa:
-  `journalctl -u rmshare-stream -n 30`.
-* Przetestowane na reMarkable Paper Pro (firmware 6.0.106). reMarkable 2 powinien działać
-  (goMarkableStream wspiera go oficjalnie), ale nie był sprawdzany.
+```bash
+ssh root@10.11.99.1 'sh /home/root/rmshare/install.sh'     # or simply re-run ./deploy.sh
+```
 
-## Pliki
+## Troubleshooting
+
+| Symptom | Likely cause and fix |
+| --- | --- |
+| `deploy.sh` stops with *"set RMSHARE_PASSWORD"* | Add `RMSHARE_PASSWORD=...` (8+ characters) to `tunnel.env`. |
+| **502 Bad Gateway** after logging in | goMarkableStream is not running. Check `journalctl -u rmshare-stream -n 30`. |
+| No URL printed after deploy | Check `journalctl -u rmshare-tunnel -n 50`. In Tailscale mode, open the printed login and Funnel links. |
+| Tailscale URL gives *"server not found"* | The public DNS record appears only after Funnel is enabled, and it can take several minutes to propagate. The first request can also take a few seconds while the certificate is issued. |
+| The page says *"The tablet is asleep"* | It is. Wake the tablet up and the picture comes back by itself. |
+| Choppy picture through the tunnel | Compare it with the local `http://10.11.99.1:8080`. If local is smooth, the tunnel is the bottleneck; if local is just as choppy, the tablet's Wi-Fi or frame encoding is. |
+| Login says *"Too many failed attempts"* | 20 failed logins (from anyone) within 15 minutes lock logging in until the window passes. Restarting `rmshare-proxy` also clears the lock. |
+
+## Security considerations
+
+This project puts a live view of your tablet on the internet. Please understand what that means:
+
+- **The password is the only barrier.** Anyone who has it can watch **everything** on your screen, including any document you open, and can **draw into your notes** through the remote pen. Use a long random password and do not reuse it. Change it whenever you have shared it with someone who should no longer have access. (Remote drawing can be disabled with `-pen-device=`.)
+- **There is a single shared password,** with no user accounts. Sessions are kept in memory for 30 days and cannot be revoked one by one. Restarting `rmshare-proxy` logs everyone out.
+- **Brute-force protection is global.** After 20 failed attempts in 15 minutes, logins are blocked for **everyone**, including you. This slows down password guessing, but it also lets anyone who knows the URL lock legitimate viewers out for a while.
+- **The URL is not a secret.** Tailscale Funnel hostnames get public TLS certificates, which are recorded in public Certificate Transparency logs, so the address can be discovered. Quick-tunnel URLs are random but not secret either. Do not rely on obscurity.
+- **The local listener uses plain HTTP.** The proxy listens on `:8080` on every interface of the tablet (USB and Wi-Fi) without TLS. On a shared or untrusted Wi-Fi network, someone else on that network can intercept the password and session cookie. Only the tunnels provide HTTPS.
+- **Everything runs as `root`.** This includes the proxy, goMarkableStream, cloudflared and tailscaled. The proxy needs root to read xochitl's memory, inject pen events, control the front light and restart xochitl. A bug in any of these components could therefore compromise the whole device.
+- **goMarkableStream runs with its own authentication disabled** (`-unsafe`, `RK_JWT_ENABLED=false`). It is bound to `127.0.0.1`, so only processes on the tablet can reach it directly.
+- **The proxy changes your tablet.** With `PUBLISH_DOC=1`, it writes a document into your xochitl library and **restarts xochitl**, which could interrupt whatever you are doing. Remote drawing writes real strokes into the open document.
+- **Secrets are stored in plain text** in `/home/root/rmshare/tunnel.env` on the device (mode `600`). That includes the password, Tailscale auth keys and Cloudflare tokens. They are also on your computer in `tunnel.env`, which is git-ignored. Never commit it.
+- **Downloads are not checksum-verified.** `deploy.sh` downloads cloudflared, Tailscale and the goMarkableStream source over HTTPS from their official locations, but it does not verify signatures or checksums.
+- **Client IPs in the logs can be spoofed.** They come from `CF-Connecting-IP` / `X-Forwarded-For` and are used only for logging.
+- **Developer mode** and root SSH access lower the tablet's own security. That is a prerequisite of this project, not something it adds.
+
+If you find a vulnerability, please report it as described in [SECURITY.md](SECURITY.md).
+
+## Project layout
 
 ```
-proxy/main.go, proxy/login.html   proxy z hasłem (Go)
-proxy/urldoc.go                    strona /url + generowanie PDF z adresem i QR do biblioteki
-device/*.service                   usługi systemd: stream, proxy, tunnel
-device/run-tunnel.sh               wybór trybu tunelu (tailscale / cloudflared token / config.yml / quick) + watchdog
-device/install.sh, uninstall.sh    instalacja usług na tablecie
-gms/build-gms.sh, gms/*.patch      build goMarkableStream ze źródeł z łatkami (Paper Pro, wielu widzów, uśpienie, auto-obrót, odświeżanie w spoczynku, zdalne pióro)
-gms/series                         kolejność nakładania łatek
-proxy/sleep.go                     watcher logu xochitl: uśpienie (blokada strumienia) i orientacja; /state z long-pollem
-proxy/viewers.go                   liczenie widzów i sygnał mrugnięciem podświetlenia
-proxy/pen.go                       zdalne pióro: WebSocket /pen -> zdarzenia evdev
-tools/pentool/                     narzędzie diagnostyczne pióra (info / record / line)
-deploy.sh                          build + pobranie + wgranie + instalacja (z Maca)
-dist/                              binarki (cache, poza repo)
+proxy/                    rmshare, the password-protected proxy (Go)
+  main.go, login.html       login form, sessions, reverse proxy
+  sleep.go                  xochitl journal watcher: sleep state, orientation, /state long-poll
+  pen.go                    remote pen: /pen WebSocket -> evdev events
+  viewers.go                viewer counting and front-light signal
+  urldoc.go                 /url page and PDF with URL + QR code for the tablet library
+gms/                      goMarkableStream build script and patches
+  build-gms.sh              downloads the upstream source, applies the patches, builds
+  series                    patch order
+  *.patch                   see docs/how-it-works.md#gomarkablestream-patches
+device/                   files installed on the tablet
+  rmshare-*.service         systemd units: stream, proxy, tunnel
+  run-tunnel.sh             tunnel mode selection (Tailscale / Cloudflare) and watchdog
+  install.sh, uninstall.sh  service installation and removal (run on the tablet)
+tools/pentool/            pen diagnostics: axis ranges, event dump, test stroke
+docs/                     detailed documentation
+deploy.sh                 build + download + upload + install (run on your computer)
+tunnel.env.example        configuration template
+dist/                     build and download cache (git-ignored)
 ```
+
+## Development
+
+```bash
+make test        # go vet + unit tests for the proxy
+make build       # cross-compile the proxy for arm and arm64 into dist/
+make gms         # build patched goMarkableStream for arm64 into dist/
+make deploy      # same as ./deploy.sh
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, including how to update the goMarkableStream patches.
+
+## Credits
+
+- [goMarkableStream](https://github.com/owulveryck/goMarkableStream) by Olivier Wulveryck (MIT) does all the heavy lifting of reading and streaming the screen. This project only patches it and wraps it.
+- [cloudflared](https://github.com/cloudflare/cloudflared), [Tailscale](https://tailscale.com) and [go-qrcode](https://github.com/skip2/go-qrcode).
+
+*reMarkable is a trademark of reMarkable AS. This project is not affiliated with, endorsed by or supported by reMarkable AS. Using developer mode and third-party software on your tablet may affect your warranty and support options.*
+
+## Disclaimer
+
+This software is experimental and provided **"as is", without warranty of any kind**, express or implied. That includes, without limitation, any warranties of merchantability, fitness for a particular purpose and non-infringement. **You use it entirely at your own risk.** In no event shall the author or contributors be liable for any claim, damages or other liability arising from the software or its use. That includes, among other things, a bricked or malfunctioning device, lost or corrupted notes, exposure of your screen content, or any other security incident. Read the code and the [Security considerations](#security-considerations) before you install it.
+
+## License
+
+[MIT](LICENSE). The patches in [`gms/`](gms/) modify goMarkableStream, which is also MIT-licensed (Copyright © 2023 Olivier Wulveryck).

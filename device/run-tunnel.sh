@@ -1,27 +1,27 @@
 #!/bin/sh
-# Uruchamia tunel w jednym z trybow (sprawdzane w tej kolejnosci):
-#  0. Tailscale Funnel             -> tunnel.env zawiera TUNNEL=tailscale (opcjonalnie TS_AUTHKEY,
-#                                     TS_HOSTNAME); staly adres https://<host>.<tailnet>.ts.net
-#  1. tunel nazwany z tokenem      -> /home/root/rmshare/tunnel.env zawiera TUNNEL_TOKEN=...
-#  2. tunel nazwany z config.yml   -> /home/root/rmshare/cloudflared/config.yml + credentials
-#  3. quick tunnel (bez konta)     -> losowy adres *.trycloudflare.com, zapisywany do tunnel-url.txt
-# W trybach 1-2 mozesz podac w tunnel.env PUBLIC_URL=https://rm.twojadomena.pl, zeby adres
-# tez trafil do tunnel-url.txt (strona /url i dokument na tablecie).
+# Starts the tunnel in one of these modes (checked in this order):
+#  0. Tailscale Funnel             -> tunnel.env contains TUNNEL=tailscale (optionally TS_AUTHKEY,
+#                                     TS_HOSTNAME); stable URL https://<host>.<tailnet>.ts.net
+#  1. named tunnel with a token    -> /home/root/rmshare/tunnel.env contains TUNNEL_TOKEN=...
+#  2. named tunnel with config.yml -> /home/root/rmshare/cloudflared/config.yml + credentials
+#  3. quick tunnel (no account)    -> random *.trycloudflare.com URL, written to tunnel-url.txt
+# In modes 1-2 you can set PUBLIC_URL=https://rm.example.com in tunnel.env so the URL
+# also ends up in tunnel-url.txt (the /url page and the document on the tablet).
 #
-# Watchdog: cloudflared po dluzszym braku sieci (np. tablet w suspendzie) potrafi w kolo
-# probowac rejestrowac tunel, ktory Cloudflare juz skasowal ("Tunnel not found"), i nigdy
-# nie zalozyc nowego. Skrypt wykrywa to (log + endpoint /ready) i konczy sie z bledem,
-# a systemd (Restart=always) uruchamia swiezy tunel. Stary adres jest wtedy kasowany.
+# Watchdog: after a long network outage (e.g. the tablet was suspended) cloudflared
+# may keep trying to register a tunnel Cloudflare has already deleted ("Tunnel not found")
+# and never create a new one. This script detects that (log + /ready endpoint) and exits
+# with an error; systemd (Restart=always) then starts a fresh tunnel. The old URL is removed.
 DIR=/home/root/rmshare
 CF=$DIR/cloudflared
 URLFILE=$DIR/tunnel-url.txt
 ORIGIN=http://127.0.0.1:8080
 METRICS=127.0.0.1:20241
-DEAD_AFTER=${TUNNEL_DEAD_AFTER:-120}   # sekund ciaglego /ready=503 przy dzialajacym internecie
 
 [ -f "$DIR/tunnel.env" ] && . "$DIR/tunnel.env"
+DEAD_AFTER=${TUNNEL_DEAD_AFTER:-120}   # seconds of continuous /ready=503 while the internet is reachable
 
-# cloudflared potrzebuje zaufanych certyfikatow CA; wskaz systemowy plik, jesli istnieje.
+# cloudflared needs trusted CA certificates; point it at the system bundle if present.
 for f in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem; do
   [ -f "$f" ] && export SSL_CERT_FILE="$f" && break
 done
@@ -31,7 +31,7 @@ write_public_url() {
 }
 
 die_and_restart() {
-  echo "watchdog: $1 - restartuje tunel"
+  echo "watchdog: $1 - restarting the tunnel"
   [ "$MODE" = quick ] && rm -f "$URLFILE"
   kill $(pidof cloudflared) $(pidof tailscaled) 2>/dev/null
   sleep 1
@@ -39,18 +39,18 @@ die_and_restart() {
   exit 1
 }
 
-# Filtr logu: przepuszcza linie do journala, wyciaga adres quick tunnelu,
-# a na "Tunnel not found" ubija cloudflared (watchdog ponizej konczy skrypt).
+# Log filter: passes lines through to the journal, extracts the quick tunnel URL,
+# and kills cloudflared on "Tunnel not found" (the watchdog below then exits).
 log_filter() {
   while IFS= read -r line; do
     echo "$line"
     case "$line" in
       *https://*.trycloudflare.com*)
         url=$(echo "$line" | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com')
-        [ -n "$url" ] && echo "$url" > "$URLFILE" && echo "ADRES: $url"
+        [ -n "$url" ] && echo "$url" > "$URLFILE" && echo "URL: $url"
         ;;
       *"Tunnel not found"*)
-        echo "watchdog: Cloudflare nie zna juz tego tunelu"
+        echo "watchdog: Cloudflare no longer knows this tunnel"
         kill $(pidof cloudflared) 2>/dev/null
         ;;
     esac
@@ -60,35 +60,35 @@ log_filter() {
 # ---------------------------------------------------------------------------
 # Tailscale Funnel
 # ---------------------------------------------------------------------------
-# Logi tailscaled/tailscale trafiaja do journala z prefiksem.
+# tailscaled/tailscale logs go to the journal with a prefix.
 prefix_log() {
   while IFS= read -r line; do echo "$1 $line"; done
 }
 
 run_tailscale() {
-  TSDIR=$DIR/tailscale-state   # (nie "tailscale": tak nazywa sie binarka CLI)
+  TSDIR=$DIR/tailscale-state   # (not "tailscale": that is the CLI binary name)
   mkdir -p "$TSDIR"
   SOCK=$TSDIR/tailscaled.sock
   TS="$DIR/tailscale --socket=$SOCK"
   HOST=${TS_HOSTNAME:-remarkable}
   LOGIN_FILE=$DIR/tailscale-login-url.txt
   FUNNEL_FILE=$DIR/tailscale-funnel-url.txt
-  echo "tryb: Tailscale Funnel (hostname $HOST)"
+  echo "mode: Tailscale Funnel (hostname $HOST)"
   rm -f "$LOGIN_FILE" "$FUNNEL_FILE"
-  # Adres Funnel jest staly, wiec zostaje miedzy restartami; adres z innego trybu kasujemy.
+  # The Funnel URL is stable, so keep it across restarts; drop a URL left by another mode.
   grep -q "\.ts\.net" "$URLFILE" 2>/dev/null || rm -f "$URLFILE"
 
-  # Brak /dev/net/tun na reMarkable -> siec w przestrzeni uzytkownika (Funnel tego nie potrzebuje).
-  # --statedir: tu tailscaled trzyma m.in. certyfikaty HTTPS dla Funnel (bez tego "no TailscaleVarRoot").
+  # No /dev/net/tun on the reMarkable -> userspace networking (Funnel does not need a TUN device).
+  # --statedir: where tailscaled keeps e.g. the Funnel HTTPS certificates (without it: "no TailscaleVarRoot").
   ( "$DIR/tailscaled" --state="$TSDIR/tailscaled.state" --statedir="$TSDIR" --socket="$SOCK" \
       --tun=userspace-networking --port=41641 2>&1 | prefix_log "tailscaled:" ) &
   TSD=$!
   i=0; while [ ! -S "$SOCK" ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
-  [ -S "$SOCK" ] || die_and_restart "tailscaled nie wystartowal"
+  [ -S "$SOCK" ] || die_and_restart "tailscaled did not start"
 
-  # Logowanie: 'tailscale up' z kluczem loguje od razu; bez klucza czeka na zatwierdzenie
-  # w przegladarce. Uruchamiamy je tylko raz (kazde nowe 'up' uniewaznia poprzedni link!),
-  # a link do zalogowania czytamy ze 'tailscale status' i zapisujemy do tailscale-login-url.txt.
+  # Login: 'tailscale up' with an auth key logs in at once; without one it waits for approval
+  # in a browser. Run it only once (every new 'up' invalidates the previous login link!),
+  # and read the login link from 'tailscale status' into tailscale-login-url.txt.
   up_args="--hostname=$HOST --accept-dns=false --accept-routes=false"
   UP_PID=""
   start_up() {
@@ -107,19 +107,19 @@ run_tailscale() {
     if [ "$state" = "Running" ]; then
       rm -f "$LOGIN_FILE"
       if [ $funnel_ok -eq 0 ]; then
-        # Funnel: publiczny HTTPS 443 -> proxy. Pierwszy raz trzeba wlaczyc Funnel w konsoli
-        # Tailscale (link w komunikacie bledu) i certyfikaty HTTPS (DNS -> HTTPS Certificates).
-        # 'tailscale funnel' czeka interaktywnie, dopoki Funnel nie jest wlaczony w tailnecie -> limit czasu
+        # Funnel: public HTTPS 443 -> proxy. The first time, Funnel must be enabled in the Tailscale
+        # admin console (link in the error message), as must HTTPS certificates (DNS -> HTTPS Certificates).
+        # 'tailscale funnel' waits interactively until Funnel is enabled in the tailnet -> timeout
         out=$(timeout 20 $TS funnel --bg --https=443 http://127.0.0.1:8080 2>&1)
         if echo "$out" | grep -q "Available on the internet\|Funnel on"; then
           funnel_ok=1
           rm -f "$FUNNEL_FILE"
           dns=$($TS status --json 2>/dev/null | grep -o '"DNSName": *"[^"]*"' | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/; s/\.$//')
-          [ -n "$dns" ] && echo "https://$dns" > "$URLFILE" && echo "ADRES: https://$dns"
+          [ -n "$dns" ] && echo "https://$dns" > "$URLFILE" && echo "URL: https://$dns"
         else
           echo "tailscale funnel: $out" | head -n 8
           echo "$out" | grep -o 'https://login.tailscale.com/[A-Za-z0-9/._?=&-]*' | head -n 1 > "$FUNNEL_FILE"
-          [ -s "$FUNNEL_FILE" ] && echo "WLACZ FUNNEL: $(cat "$FUNNEL_FILE")"
+          [ -s "$FUNNEL_FILE" ] && echo "ENABLE FUNNEL: $(cat "$FUNNEL_FILE")"
         fi
       fi
     elif [ "$state" = "NeedsLogin" ]; then
@@ -127,14 +127,14 @@ run_tailscale() {
       url=$($TS status 2>&1 | grep -o 'https://login.tailscale.com/[A-Za-z0-9/._-]*' | head -n 1)
       if [ -n "$url" ] && [ "$url" != "$(cat "$LOGIN_FILE" 2>/dev/null)" ]; then
         echo "$url" > "$LOGIN_FILE"
-        echo "ZALOGUJ URZADZENIE: $url"
+        echo "LOG THE DEVICE IN: $url"
       fi
-      # sesja wygasla / urzadzenie usuniete z tailnetu: 'up' juz nie dziala -> uruchom ponownie
+      # session expired / device removed from the tailnet: 'up' has exited -> start it again
       kill -0 "$UP_PID" 2>/dev/null || start_up
     fi
     sleep 10
   done
-  die_and_restart "tailscaled zakonczyl sie"
+  die_and_restart "tailscaled exited"
 }
 
 if [ "$TUNNEL" = "tailscale" ]; then
@@ -144,21 +144,21 @@ if [ "$TUNNEL" = "tailscale" ]; then
 fi
 
 if [ -n "$TUNNEL_TOKEN" ]; then
-  MODE=token; echo "tryb: tunel nazwany (token)"; write_public_url
+  MODE=token; echo "mode: named tunnel (token)"; write_public_url
   set -- tunnel --no-autoupdate --metrics "$METRICS" run --token "$TUNNEL_TOKEN"
 elif [ -f "$DIR/cloudflared/config.yml" ]; then
-  MODE=config; echo "tryb: tunel nazwany (config.yml)"; write_public_url
+  MODE=config; echo "mode: named tunnel (config.yml)"; write_public_url
   set -- tunnel --no-autoupdate --metrics "$METRICS" --config "$DIR/cloudflared/config.yml" run
 else
-  MODE=quick; echo "tryb: quick tunnel (adres losowy, zapisze go do $URLFILE)"; rm -f "$URLFILE"
+  MODE=quick; echo "mode: quick tunnel (random URL, written to $URLFILE)"; rm -f "$URLFILE"
   set -- tunnel --no-autoupdate --metrics "$METRICS" --url "$ORIGIN"
 fi
 
 ( "$CF" "$@" 2>&1 | log_filter ) &
 CHILD=$!
 
-# Watchdog: co 10 s sprawdza /ready cloudflared. Brak gotowosci przez DEAD_AFTER sekund
-# przy osiagalnym internecie oznacza martwy tunel.
+# Watchdog: checks cloudflared's /ready every 10 s. Not ready for DEAD_AFTER seconds
+# while the internet is reachable means the tunnel is dead.
 down=0
 while kill -0 "$CHILD" 2>/dev/null; do
   sleep 10
@@ -167,11 +167,11 @@ while kill -0 "$CHILD" 2>/dev/null; do
   else
     if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; then
       down=$((down + 10))
-      [ $down -ge "$DEAD_AFTER" ] && die_and_restart "tunel niegotowy od ${down}s mimo dzialajacej sieci"
+      [ $down -ge "$DEAD_AFTER" ] && die_and_restart "tunnel not ready for ${down}s although the network works"
     else
-      down=0   # brak internetu: to nie wina tunelu, czekaj
+      down=0   # no internet: not the tunnel's fault, keep waiting
     fi
   fi
 done
 wait "$CHILD"
-die_and_restart "cloudflared zakonczyl sie"
+die_and_restart "cloudflared exited"

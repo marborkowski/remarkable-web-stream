@@ -1,10 +1,14 @@
 #!/bin/sh
-# Buduje goMarkableStream ze zrodel (wersja GMS_VERSION) z nasza latka na
-# wykrywanie bufora ekranu w reMarkable Paper Pro (pointer_arm64.patch) i
-# wielu widzow naraz (stream_preempt.patch), usypianie i auto-obrot w kliencie
-# (client_sleep.patch, client_orientation.patch). Kolejnosc: gms/series.
+# Builds goMarkableStream (version GMS_VERSION) from source with this project's
+# patches applied in the order listed in gms/series:
+#   pointer_arm64.patch        framebuffer detection on the reMarkable Paper Pro
+#   stream_preempt.patch       several concurrent viewers
+#   client_sleep.patch         "tablet asleep" / "cannot reach" overlay, endless reconnect
+#   client_orientation.patch   auto-rotate the preview with the tablet
+#   stream_idle_refresh.patch  keep refreshing the picture without pen input
+#   client_pen.patch           draw on the tablet from the browser (remote pen)
 #
-#   gms/build-gms.sh <arm|arm64> <plik-wyjsciowy>
+#   gms/build-gms.sh <arm|arm64> <output-file>
 set -eu
 GOARCH=$1
 OUT=$2
@@ -16,17 +20,17 @@ SRC=$ROOT/dist/gms-src-$GMS_VERSION
 
 if [ ! -f "$SRC/.patched" ]; then
   rm -rf "$SRC" && mkdir -p "$SRC"
-  echo "    pobieram zrodla goMarkableStream $GMS_VERSION"
+  echo "    downloading goMarkableStream $GMS_VERSION source"
   curl -fsSL --retry 3 "https://github.com/owulveryck/goMarkableStream/archive/refs/tags/$GMS_VERSION.tar.gz" \
     | tar xz -C "$SRC" --strip-components=1
-  # Kolejnosc z gms/series (latki klienta naklada sie jedna na drugiej).
+  # Order from gms/series (the client patches build on top of each other).
   while read -r name; do
     case "$name" in ''|'#'*) continue ;; esac
-    echo "    nakladam latke $name"
+    echo "    applying patch $name"
     ( cd "$SRC" && patch -p1 --no-backup-if-mismatch < "$ROOT/gms/$name" )
   done < "$ROOT/gms/series"
   touch "$SRC/.patched"
 fi
 
-echo "    go build (GOARCH=$GOARCH, bez tailscale)"
+echo "    go build (GOARCH=$GOARCH)"
 ( cd "$SRC" && CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH GOARM=7 "$GO" build -trimpath -ldflags="-s -w" -o "$OUT" . )

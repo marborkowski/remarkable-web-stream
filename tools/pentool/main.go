@@ -1,8 +1,8 @@
-// pentool: diagnostyka i test wstrzykiwania zdarzeń pióra na reMarkable.
+// pentool: pen event diagnostics and injection test for the reMarkable.
 //
-//	pentool info   [dev]                 zakresy osi (EVIOCGABS)
-//	pentool record [dev] [sekundy]       zrzut zdarzeń z prawdziwego pióra
-//	pentool line   [dev] x1 y1 x2 y2     kreska w pikselach ekranu (pion, natywnie)
+//	pentool info   [dev]                 axis ranges (EVIOCGABS)
+//	pentool record [dev] [seconds]       dump events from the real pen
+//	pentool line   [dev] x1 y1 x2 y2     draw a line in screen pixels (native portrait)
 package main
 
 import (
@@ -28,7 +28,7 @@ const (
 
 type absInfo struct{ Value, Min, Max, Fuzz, Flat, Res int32 }
 
-func eviocgabs(abs int) uintptr { return uintptr(0x80184540 + abs) } // _IOR('E', 0x40+abs, 24 bytes)
+func eviocgabs(abs int) uintptr { return uintptr(0x80184540) + uintptr(abs) } // _IOR('E', 0x40+abs, 24 bytes)
 
 func getAbs(f *os.File, abs int) (absInfo, error) {
 	var a absInfo
@@ -39,7 +39,8 @@ func getAbs(f *os.File, abs int) (absInfo, error) {
 	return a, nil
 }
 
-// input_event on 64-bit: timeval (16 B) + type u16 + code u16 + value s32 = 24 B
+// input_event on 64-bit: timeval (16 B) + type u16 + code u16 + value s32 = 24 B.
+// pentool assumes this 64-bit layout (reMarkable Paper Pro); build it for arm64.
 func write(f *os.File, typ, code uint16, value int32) {
 	var b [24]byte
 	now := time.Now()
@@ -121,14 +122,14 @@ func main() {
 			return int32(px / screenW * float64(ax.Max)), int32(py / screenH * float64(ay.Max))
 		}
 		x, y := toAbs(c[0], c[1])
-		// zbliżenie pióra
+		// pen enters range
 		write(f, evKey, btnToolPen, 1)
 		write(f, evAbs, absX, x)
 		write(f, evAbs, absY, y)
 		write(f, evAbs, absDistance, 10)
 		syn(f)
 		time.Sleep(20 * time.Millisecond)
-		// dotknięcie
+		// pen touches the screen
 		write(f, evAbs, absDistance, 0)
 		write(f, evAbs, absPressure, pressure)
 		write(f, evKey, btnTouch, 1)
@@ -143,7 +144,7 @@ func main() {
 			syn(f)
 			time.Sleep(8 * time.Millisecond)
 		}
-		// podniesienie i oddalenie
+		// lift and leave range
 		write(f, evAbs, absPressure, 0)
 		write(f, evKey, btnTouch, 0)
 		write(f, evAbs, absDistance, 10)
@@ -151,6 +152,6 @@ func main() {
 		time.Sleep(20 * time.Millisecond)
 		write(f, evKey, btnToolPen, 0)
 		syn(f)
-		fmt.Printf("kreska wstrzyknieta (nacisk %d/%d)\n", pressure, ap.Max)
+		fmt.Printf("line injected (pressure %d/%d)\n", pressure, ap.Max)
 	}
 }

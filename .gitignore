@@ -1,3 +1,12 @@
+# Build output and download cache
 dist/
+
+# Local configuration and secrets (see tunnel.env.example)
 tunnel.env
 cloudflared/
+
+# OS / editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

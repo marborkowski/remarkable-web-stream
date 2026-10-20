@@ -1,5 +1,5 @@
 [Unit]
-Description=rmshare: goMarkableStream (ekran reMarkable, tylko localhost)
+Description=rmshare: goMarkableStream (reMarkable screen, localhost only)
 After=xochitl.service
 Wants=xochitl.service
 
