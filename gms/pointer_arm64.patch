@@ -47,7 +47,7 @@
  		offset += int64(length - 2)
  
  		// Seek to the start address plus offset and read the header
-@@ -124,3 +143,88 @@
+@@ -124,3 +143,93 @@
  	// Return the calculated frame pointer address
  	return startAddress + offset, nil
  }
@@ -55,9 +55,12 @@
 +// findFrameChunk scans the anonymous private mappings of the process for a
 +// glibc malloc chunk served by mmap that is large enough to hold one frame
 +// and whose content looks like an opaque BGRA image (alpha byte == 0xff).
-+// Such a chunk starts with a 16-byte header: prev_size (8 bytes, zero for
-+// mmapped chunks) and size|flags (8 bytes, flag 0x2 = IS_MMAPPED). Several
-+// mmapped chunks may share one mapping, so the whole mapping is scanned.
++// Such a chunk starts on a page boundary with a 16-byte header: prev_size
++// (8 bytes, zero for mmapped chunks) and size|flags (8 bytes, flag 0x2 =
++// IS_MMAPPED). Several mmapped chunks may share one mapping, so every page
++// of the mapping is checked. Only page boundaries count: inside other large
++// buffers (page images xochitl keeps after drawing long pages), data can
++// look like such a header too.
 +// The returned address is the chunk start, matching the semantics of the
 +// walk-based detection (the first 16 bytes read are the header).
 +func findFrameChunk(pid string) (int64, error) {
@@ -73,6 +76,7 @@
 +	defer mem.Close()
 +
 +	const maxSlack = 4 << 20 // chunk may be a bit bigger than the frame (alignment, padding)
++	const pageSize = 4096
 +	scanner := bufio.NewScanner(maps)
 +	for scanner.Scan() {
 +		fields := strings.Fields(scanner.Text())
@@ -98,12 +102,13 @@
 +			continue
 +		}
 +		region = region[:n]
-+		for off := int64(0); off+16 <= int64(len(region)); off += 16 {
++		for off := int64(0); off+16 <= int64(len(region)); off += pageSize { // mappings start on a page
 +			if binary.LittleEndian.Uint64(region[off:off+8]) != 0 {
 +				continue // prev_size must be zero for an mmapped chunk
 +			}
-+			chunkSize := int64(binary.LittleEndian.Uint64(region[off+8:off+16])) &^ 7
-+			if chunkSize < ScreenSizeBytes || chunkSize > ScreenSizeBytes+maxSlack || off+16+ScreenSizeBytes > int64(len(region)) {
++			sizeFlags := binary.LittleEndian.Uint64(region[off+8 : off+16])
++			chunkSize := int64(sizeFlags) &^ 7
++			if sizeFlags&2 == 0 || chunkSize < ScreenSizeBytes || chunkSize > ScreenSizeBytes+maxSlack || off+16+ScreenSizeBytes > int64(len(region)) {
 +				continue
 +			}
 +			if looksLikeOpaqueBGRA(region[off+16 : off+16+ScreenSizeBytes]) {

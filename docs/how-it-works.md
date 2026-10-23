@@ -146,7 +146,7 @@ The patches live in [`gms/`](../gms/) and are applied by [`gms/build-gms.sh`](..
 
 | Patch | Changes |
 | --- | --- |
-| `pointer_arm64.patch` | **Paper Pro framebuffer detection.** Upstream finds the framebuffer by walking from the last `/dev/dri/card0` mapping. That works only after a cold boot; after a `xochitl` restart it got stuck in an endless loop. The patch scans xochitl's anonymous mappings for an mmapped glibc malloc chunk of frame size whose content looks like an opaque BGRA image. The old method remains as a fallback, now guarded against looping. |
+| `pointer_arm64.patch` | **Paper Pro framebuffer detection.** Upstream finds the framebuffer by walking from the last `/dev/dri/card0` mapping. That works only after a cold boot; after a `xochitl` restart it got stuck in an endless loop. The patch scans xochitl's anonymous mappings for an mmapped glibc malloc chunk of frame size, starting on a page boundary, whose content looks like an opaque BGRA image (other large buffers, such as the page images xochitl keeps after drawing long pages, can hold data that looks like a chunk header elsewhere). The old method remains as a fallback, now guarded against looping. |
 | `stream_preempt.patch` | Per-connection delta encoder; up to 3 concurrent viewers; the newest viewer preempts instead of getting a 429. |
 | `client_sleep.patch` | "The tablet is asleep" / "Cannot reach the tablet" overlay, handling of the proxy's 503, and endless reconnect with backoff capped at 10 s. |
 | `client_orientation.patch` | **Auto-rotate** button and shortcut, plus the `/state` long-poll. |
