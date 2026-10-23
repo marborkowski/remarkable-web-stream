@@ -39,7 +39,7 @@ func TestParseOrientation(t *testing.T) {
 
 func TestStateLongPollWakesOnOrientation(t *testing.T) {
 	sw := newSleepWatcher()
-	h := handleState(sw, nil)
+	h := handleState(sw, nil, false)
 	done := make(chan string, 1)
 	go func() {
 		rec := httptest.NewRecorder()

@@ -5,20 +5,35 @@ This document describes the moving parts in more detail than the [README](../REA
 ## Components
 
 - **goMarkableStream** ([upstream](https://github.com/owulveryck/goMarkableStream)) reads the screen from the memory of `xochitl` (the reMarkable UI process) and serves a page with a WebGL preview, plus a delta-encoded frame stream at `/stream`. It runs only on `127.0.0.1:2011`, with its own login disabled (`-unsafe`, `RK_JWT_ENABLED=false`). It is built from source with the patches described [below](#gomarkablestream-patches).
-- **rmshare** ([`proxy/`](../proxy/)) sits in front of it on `:8080`. Without a valid session cookie it shows the login form. After login it forwards everything, including the long-lived `/stream` response and the `/events` SSE feed (`FlushInterval: -1`). It also implements the features below.
+- **rmshare** ([`proxy/`](../proxy/)) sits in front of it on `:8080`. Without a valid session cookie it shows the login form, or the join page for an invite link. After login it forwards everything, including the long-lived `/stream` response and the `/events` SSE feed (`FlushInterval: -1`). It also implements the features below.
 - **cloudflared / tailscaled** publish the proxy (see [tunnels.md](tunnels.md)).
 
 ## Proxy endpoints
 
 | Path | Auth | Description |
 | --- | --- | --- |
-| `/login` | — | Login form (GET) and password check (POST). |
+| `/login` | — | Login form (GET) and password check (POST): opens an **owner** session. |
+| `/join/<token>` | — | Join page for an invite link (GET); `POST /join` opens a **guest** session. |
 | `/logout` | — | Revokes the session. |
+| `/invites` | owner | Invitations page: create and revoke links, list and end sessions. POST actions need the per-session CSRF token. |
 | `/healthz` | — | Returns `ok`. |
-| `/state` | ✔ | JSON `{"awake", "since", "orientation", "version", "viewers"}`. With `?wait=<version>` it long-polls for up to 25 s until the state changes. |
-| `/pen` | ✔ | WebSocket for remote drawing (same-origin only). |
+| `/state` | ✔ | JSON `{"awake", "since", "orientation", "version", "viewers", "role", "canDraw"}`. With `?wait=<version>` it long-polls for up to 25 s until the state changes. |
+| `/pen` | owner | WebSocket for remote drawing (same-origin only). |
 | `/url`, `/url/qr.png` | ✔ | Current public URL and its QR code. `/url?format=txt` returns plain text. |
 | everything else | ✔ | Proxied to goMarkableStream. `/stream`, `/screenshot`, `/events`, `/gestures` and `/raw` return **503** while the tablet sleeps. |
+
+## Roles and invite links
+
+- **Owner:** signs in with `RMSHARE_PASSWORD`. Watches, draws and manages `/invites`. Sessions last 30 days.
+- **Guest:** opens an invite link. Watches only. The session lasts exactly as long as the invitation.
+
+An invitation is a 192-bit random token in a link (`/join/<token>`). The proxy stores only its SHA-256 hash, a label, the expiry and the number of sessions it opened, so the link can be shown only once, at creation time. Opening the link shows a page with a *Join* button; only the POST creates the session, so link previews and prefetchers do not open sessions. An invalid or expired link counts as a failed attempt for the lockout, like a wrong password.
+
+Sessions are 256-bit random tokens in the `rmshare_session` cookie (`HttpOnly`, `SameSite=Lax`, `Secure` behind HTTPS). The proxy keeps their hashes with the role, the invitation, the client IP and the last activity in `state.json` (written atomically, mode `600`) and reloads it at start, so a restart does not log anyone out. Revoking an invitation deletes every session opened through it. The forms on `/invites` carry a per-session CSRF token and must come from the same origin.
+
+Lockout: 10 failures from one client IP within 15 minutes block that IP; 100 failures from all IPs together block everyone. The IP comes from `CF-Connecting-IP` / `X-Forwarded-For`, which only the tunnel sets reliably.
+
+The page learns its role from `/state` (`role`, `canDraw`). Guests do not see the *Draw* button, and the owner gets an *Invite* button (`client_roles.patch`). A `401` from `/state` reloads the page, which lands on the login form once a session has ended.
 
 ## Sleep detection
 
@@ -106,6 +121,7 @@ The patches live in [`gms/`](../gms/) and are applied by [`gms/build-gms.sh`](..
 | `client_orientation.patch` | **Auto-rotate** button and shortcut, plus the `/state` long-poll. |
 | `stream_idle_refresh.patch` | Keeps refreshing at 0.5 s without pen input, and applies a pending rotation with the first changed frame. |
 | `client_pen.patch` | **Draw** button and shortcut, pointer to native coordinate mapping, and the `/pen` WebSocket client. |
+| `client_roles.patch` | Owner/guest roles from `/state`: hides **Draw** for guests, adds the **Invite** button for the owner, reloads the page when the session ends. |
 
 To update the patches for a new upstream version, see [CONTRIBUTING.md](../CONTRIBUTING.md#updating-the-gomarkablestream-patches).
 

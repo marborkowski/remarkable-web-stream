@@ -35,7 +35,7 @@ Open a URL on any computer or phone, type the password, and see what you write a
 ## Features
 
 - **Live screen in the browser.** The tablet's framebuffer is streamed with WebGL rendering and delta-encoded frames, courtesy of [goMarkableStream](https://github.com/owulveryck/goMarkableStream).
-- **Password protection.** A small Go reverse proxy (`rmshare`) handles the login form, session cookies and brute-force throttling.
+- **Password and invite links.** A small Go reverse proxy (`rmshare`) handles the login form, session cookies and brute-force throttling. You sign in with the password. Other people get **invite links** that expire or can be revoked, and that only let them watch, not draw.
 - **Reachable from anywhere.** You can use [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) (a stable URL, free, no domain needed), a Cloudflare quick tunnel (no account at all), or a Cloudflare named tunnel (your own domain).
 - **Draw from the browser.** You can draw on the tablet with a mouse, finger or stylus. Strokes are injected as real pen events, so they use the tool currently selected on the tablet.
 - **Auto-rotate.** The preview follows the tablet's orientation within a fraction of a second.
@@ -101,7 +101,7 @@ For the details of each feature and of each patch, see [docs/how-it-works.md](do
    ```
    URL: https://something-random.trycloudflare.com
    ```
-4. **Open the URL, enter the password** and watch.
+4. **Open the URL, enter the password** and watch. To let someone else watch, create an invite link on `/invites` (see [Inviting viewers](#inviting-viewers)).
 
 Downloaded and built artifacts are cached in `dist/`. Delete `dist/` (or the relevant files in it) to force a fresh build or download.
 
@@ -133,12 +133,23 @@ The viewer is goMarkableStream's web UI with a few additions in the left-hand me
 | Button | Key | What it does |
 | --- | --- | --- |
 | **Auto-rotate** | `A` | Follow the tablet's orientation (on by default; the choice is remembered). A manual **Rotate** (`R`) turns auto-rotate off. |
-| **Draw** | `D` | Turn the preview into a drawing surface. Strokes go to the tablet with a fixed 50% pressure and the tool currently selected on the tablet (pen, marker, eraser, …). Only one person can draw at a time. |
+| **Draw** | `D` | Turn the preview into a drawing surface. Strokes go to the tablet with a fixed 50% pressure and the tool currently selected on the tablet (pen, marker, eraser, …). Only one person can draw at a time. Guests do not get this button. |
+| **Invite** | | Open the [invitations page](#inviting-viewers) (`/invites`). Shown only to the owner. |
 
 Other behaviour to know about:
 - **Sleep.** While the tablet sleeps, the page shows *"The tablet is asleep"* and checks every 5 s. When the tablet cannot be reached, it shows *"Cannot reach the tablet"* and keeps retrying indefinitely.
 - **Viewer signal.** The front light blinks **twice** about 2 s after the first viewer connects. It blinks **once, longer** about 15 s after the last viewer leaves. With a bright light the blink dims it; with a dim or off light the blink brightens it. Your brightness is always restored.
-- **Log out** by visiting `/logout`.
+- **Log out** by visiting `/logout`, or from the *Who is signed in* list on `/invites`.
+
+### Inviting viewers
+
+You do not need to share the password. Open **`/invites`** (the **Invite** button in the menu) and create a link:
+
+- Give it a label (who it is for) and a lifetime from 1 hour to 30 days.
+- The link (`https://…/join/<random token>`) is shown **once**, with a QR code. Anyone who opens it and presses *Join* can watch until the link expires or you revoke it.
+- Guests can only **watch**. The *Draw* button is hidden for them and the pen endpoint refuses them.
+- The same page lists everyone who is signed in, with the IP address and the last activity, and lets you end any session. Revoking a link ends all sessions opened through it.
+- Links and sessions survive a proxy restart and a reboot. They are stored in `/home/root/rmshare/state.json`.
 
 ## Configuration
 
@@ -146,7 +157,7 @@ Most settings live in **`tunnel.env`** (see [`tunnel.env.example`](tunnel.env.ex
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `RMSHARE_PASSWORD` | *(required)* | Viewer password, at least 8 characters. |
+| `RMSHARE_PASSWORD` | *(required)* | Owner password, at least 8 characters. |
 | `TUNNEL` | *(unset)* | Set to `tailscale` for Tailscale Funnel. |
 | `TS_HOSTNAME` | `remarkable` | Tailscale machine name, which becomes part of the URL. |
 | `TS_AUTHKEY` | *(unset)* | Optional Tailscale auth key for unattended login. |
@@ -161,7 +172,8 @@ The proxy itself has command-line flags. Change them in [`device/rmshare-proxy.s
 | --- | --- | --- |
 | `-listen` | `:8080` | Listen address. |
 | `-upstream` | `http://127.0.0.1:2011` | goMarkableStream address. |
-| `-password` | `$RMSHARE_PASSWORD` | Viewer password. |
+| `-password` | `$RMSHARE_PASSWORD` | Owner password. |
+| `-state-file` | `/home/root/rmshare/state.json` | Sessions and invitations, kept across restarts (`""` = memory only). |
 | `-urlfile` | `/home/root/rmshare/tunnel-url.txt` | File holding the current public URL. |
 | `-doc` | `false` | Publish the URL document (the unit passes `${PUBLISH_DOC}`). |
 | `-xochitl-dir` | `/home/root/.local/share/remarkable/xochitl` | xochitl document directory. |
@@ -202,7 +214,7 @@ ssh root@10.11.99.1 'sh /home/root/rmshare/install.sh'     # or simply re-run ./
 | Tailscale URL gives *"server not found"* | The public DNS record appears only after Funnel is enabled, and it can take several minutes to propagate. The first request can also take a few seconds while the certificate is issued. |
 | The page says *"The tablet is asleep"* | It is. Wake the tablet up and the picture comes back by itself. |
 | Choppy picture through the tunnel | Compare it with the local `http://10.11.99.1:8080`. If local is smooth, the tunnel is the bottleneck; if local is just as choppy, the tablet's Wi-Fi or frame encoding is. |
-| Login says *"Too many failed attempts"* | 20 failed logins (from anyone) within 15 minutes lock logging in until the window passes. Restarting `rmshare-proxy` also clears the lock. |
+| Login says *"Too many failed attempts"* | 10 wrong passwords or invalid invite links from one IP address within 15 minutes block that address until the window passes (100 from all addresses together block everyone). Restarting `rmshare-proxy` also clears the lock. |
 
 ## Intended use and limitations
 
@@ -220,9 +232,10 @@ If you need to present to a larger audience, share your screen to a single viewe
 
 This project puts a live view of your tablet on the internet. Please understand what that means:
 
-- **The password is the only barrier.** Anyone who has it can watch **everything** on your screen, including any document you open, and can **draw into your notes** through the remote pen. Use a long random password and do not reuse it. Change it whenever you have shared it with someone who should no longer have access. (Remote drawing can be disabled with `-pen-device=`.)
-- **There is a single shared password,** with no user accounts. Sessions are kept in memory for 30 days and cannot be revoked one by one. Restarting `rmshare-proxy` logs everyone out.
-- **Brute-force protection is global.** After 20 failed attempts in 15 minutes, logins are blocked for **everyone**, including you. This slows down password guessing, but it also lets anyone who knows the URL lock legitimate viewers out for a while.
+- **The password gives full access.** Anyone who has it can watch **everything** on your screen, including any document you open, can **draw into your notes** through the remote pen and can invite others. Keep it to yourself and give other people invite links instead. Use a long random password and do not reuse it. (Remote drawing can be disabled with `-pen-device=`.)
+- **An invite link is a key.** Anyone holding it can watch until it expires or you revoke it. Links travel through chat apps and show up in tunnel and browser logs, so keep lifetimes short and revoke links you no longer need. Guests cannot draw and cannot see or create invitations.
+- **There is one owner password** and no user accounts. Owner sessions last 30 days; guest sessions end with their link. Everyone who is signed in is listed on `/invites`, where you can end any session. Sessions and link hashes are stored in `/home/root/rmshare/state.json` (mode `600`), so a restart does not log anyone out. To log everyone out, delete that file and restart `rmshare-proxy`.
+- **Brute-force protection is per IP address.** After 10 failed attempts (wrong passwords or invalid invite links) within 15 minutes, that address is blocked until the window passes. 100 failures from all addresses together block everyone. The address comes from the tunnel's headers, which a client on the local network can forge, so the global limit is the real backstop. Anyone who knows the URL can still lock out one address, or, with enough addresses, everyone, for a while.
 - **The URL is not a secret.** Tailscale Funnel hostnames get public TLS certificates, which are recorded in public Certificate Transparency logs, so the address can be discovered. Quick-tunnel URLs are random but not secret either. Do not rely on obscurity.
 - **The local listener uses plain HTTP.** The proxy listens on `:8080` on every interface of the tablet (USB and Wi-Fi) without TLS. On a shared or untrusted Wi-Fi network, someone else on that network can intercept the password and session cookie. Only the tunnels provide HTTPS.
 - **Everything runs as `root`.** This includes the proxy, goMarkableStream, cloudflared and tailscaled. The proxy needs root to read xochitl's memory, inject pen events, control the front light and restart xochitl. A bug in any of these components could therefore compromise the whole device.
@@ -240,7 +253,9 @@ If you find a vulnerability, please report it as described in [SECURITY.md](SECU
 
 ```
 proxy/                    rmshare, the password-protected proxy (Go)
-  main.go, login.html       login form, sessions, reverse proxy
+  main.go                   routes, login, join and invitation handlers, reverse proxy
+  auth.go                   roles, invite links, sessions, state file, lockout
+  pages.go, pages.html      login, join and invitation pages
   sleep.go                  xochitl journal watcher: sleep state, orientation, /state long-poll
   pen.go                    remote pen: /pen WebSocket -> evdev events
   viewers.go                viewer counting and front-light signal

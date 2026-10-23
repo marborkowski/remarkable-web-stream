@@ -1,0 +1,73 @@
+--- a/client/index.html
++++ b/client/index.html
+@@ -58,6 +58,15 @@
+ 							<div class="button-tooltip">Draw on the tablet <kbd>D</kbd></div>
+ 						</button>
+ 					</li>
++					<li id="inviteMenuItem" style="display: none;">
++						<button id="inviteButton" class="apple-button" aria-label="Invite viewers: create and revoke invite links">
++							<svg class="button-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
++								<path fill="currentColor" d="M15,14C12.33,14 7,15.33 7,18V20H23V18C23,15.33 17.67,14 15,14M6,10V7H4V10H1V12H4V15H6V12H9V10M15,12A4,4 0 0,0 19,8A4,4 0 0,0 15,4A4,4 0 0,0 11,8A4,4 0 0,0 15,12Z"/>
++							</svg>
++							<span>Invite</span>
++							<div class="button-tooltip">Invite viewers (links that cannot draw)</div>
++						</button>
++					</li>
+ 					<li id="layersMenuItem" style="display: none;">
+ 						<button id="switchOrderButton" class="apple-button" aria-label="Toggle layer order: drawing or content on top" aria-pressed="false">
+ 							<svg class="button-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+\ No newline at end of file
+--- a/client/uiInteractions.js
++++ b/client/uiInteractions.js
+@@ -811,12 +811,17 @@
+             const response = await fetch('/state?wait=' + deviceStateVersion, { cache: 'no-store' });
+             if (response.status === 404) {
+                 return; // not served through the rmshare proxy: nothing to follow
++            }
++            if (response.status === 401) {
++                location.reload(); // session ended (expired, revoked): back to the login page
++                return;
+             }
+             if (!response.ok) {
+                 throw new Error('HTTP ' + response.status);
+             }
+             const state = await response.json();
+             deviceStateVersion = state.version;
++            applyAccess(state);
+             if (state.orientation && state.orientation !== deviceOrientation) {
+                 const first = deviceOrientation === null;
+                 deviceOrientation = state.orientation;
+@@ -965,6 +970,33 @@
+ visibleCanvas.addEventListener('lostpointercapture', onPenUp);
+ 
+ document.getElementById('drawToggle').addEventListener('click', function () {
++    if (!canDraw) {
++        showMessage('Only the owner can draw on the tablet', MessageDuration.QUICK);
++        return;
++    }
+     setDrawMode(!drawMode);
+     showMessage(drawMode ? 'Drawing on the tablet: on (uses the tool selected on the tablet)' : 'Drawing on the tablet: off', MessageDuration.QUICK);
++});
++
++// ---------------------------------------------------------------------------
++// Roles: the owner (password) can draw and invite; guests (invite links) only
++// watch. /state tells us which one we are.
++// ---------------------------------------------------------------------------
++let canDraw = true;
++
++function applyAccess(state) {
++    if (typeof state.canDraw === 'boolean' && state.canDraw !== canDraw) {
++        canDraw = state.canDraw;
++        const draw = document.getElementById('drawToggle');
++        if (draw) draw.parentElement.style.display = canDraw ? '' : 'none';
++        if (!canDraw && drawMode) {
++            setDrawMode(false);
++        }
++    }
++    const invite = document.getElementById('inviteMenuItem');
++    if (invite) invite.style.display = state.role === 'owner' ? '' : 'none';
++}
++
++document.getElementById('inviteButton').addEventListener('click', function () {
++    location.href = '/invites';
+ });

@@ -236,7 +236,8 @@ func gateSleep(sw *sleepWatcher, next http.Handler) http.Handler {
 // handleState returns the tablet state. With ?wait=<version> it acts as a
 // long-poll: if the version has not changed, it waits up to 25 s for a change
 // (orientation or sleep), so the browser learns about a rotation right away.
-func handleState(sw *sleepWatcher, vs *viewerSignal) http.HandlerFunc {
+// It also tells the page the viewer's role and whether it may draw.
+func handleState(sw *sleepWatcher, vs *viewerSignal, penEnabled bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if v := r.URL.Query().Get("wait"); v != "" {
 			var want uint64
@@ -266,6 +267,10 @@ func handleState(sw *sleepWatcher, vs *viewerSignal) http.HandlerFunc {
 		sw.mu.Unlock()
 		if vs != nil {
 			resp["viewers"] = vs.viewers()
+		}
+		if sess, ok := sessionFrom(r); ok {
+			resp["role"] = sess.Role
+			resp["canDraw"] = penEnabled && sess.canDraw()
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")

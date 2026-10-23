@@ -1,0 +1,155 @@
+{{define "head"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>reMarkable Live</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    background: #f3f1ec; color: #1d1d1b; padding: 16px; box-sizing: border-box;
+  }
+  @media (prefers-color-scheme: dark) { body { background: #161616; color: #ececec; } }
+  .card {
+    width: min(100%, 340px); padding: 32px 28px; border-radius: 14px; box-sizing: border-box;
+    background: rgba(255,255,255,.75); box-shadow: 0 8px 30px rgba(0,0,0,.12);
+    backdrop-filter: blur(8px);
+  }
+  .card.wide { width: min(100%, 760px); }
+  @media (prefers-color-scheme: dark) { .card { background: rgba(40,40,40,.85); } }
+  h1 { font-size: 1.25rem; margin: 0 0 4px; font-weight: 600; }
+  h2 { font-size: 1rem; margin: 28px 0 8px; font-weight: 600; }
+  p.sub { margin: 0 0 20px; opacity: .65; font-size: .9rem; }
+  input[type=password], input[type=text], select {
+    width: 100%; box-sizing: border-box; font-size: 1.05rem; padding: 12px 14px;
+    border: 1px solid rgba(128,128,128,.4); border-radius: 8px; background: transparent; color: inherit;
+  }
+  button {
+    width: 100%; margin-top: 12px; padding: 12px; font-size: 1rem; font-weight: 600;
+    border: 0; border-radius: 8px; background: #1d1d1b; color: #fff; cursor: pointer;
+  }
+  @media (prefers-color-scheme: dark) { button { background: #ececec; color: #161616; } }
+  button.small { width: auto; margin: 0; padding: 6px 10px; font-size: .85rem; font-weight: 500; }
+  button.quiet { background: transparent; color: inherit; border: 1px solid rgba(128,128,128,.4); }
+  .err { color: #c0392b; font-size: .9rem; margin: 0 0 12px; }
+  .row { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
+  .row > label { flex: 1 1 180px; font-size: .85rem; opacity: .8; }
+  .row > label > * { margin-top: 4px; }
+  .row > button { flex: 0 0 auto; margin: 0; width: auto; padding: 12px 18px; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid rgba(128,128,128,.25); vertical-align: middle; }
+  th { font-weight: 600; opacity: .7; font-size: .8rem; }
+  td form { margin: 0; }
+  .muted { opacity: .6; }
+  .new { margin: 16px 0 0; padding: 16px; border-radius: 10px; background: rgba(46,204,113,.12); border: 1px solid rgba(46,204,113,.4); }
+  .new input { font-family: ui-monospace, Menlo, monospace; font-size: .9rem; }
+  .new img { display: block; margin: 12px auto 0; width: 192px; image-rendering: pixelated; }
+  .links { margin: 24px 0 0; font-size: .9rem; opacity: .75; }
+  .links a { color: inherit; }
+  .scroll { overflow-x: auto; }
+</style>
+</head>
+<body>{{end}}
+
+{{define "foot"}}</body>
+</html>{{end}}
+
+{{define "login"}}{{template "head" .}}
+<form class="card" method="post" action="/login" autocomplete="off">
+  <h1>reMarkable Live</h1>
+  <p class="sub">Enter the password to watch the screen live.</p>
+  {{if .Error}}<p class="err">{{.Error}}</p>{{end}}
+  <input type="password" name="password" placeholder="Password" autofocus required>
+  <button type="submit">Sign in</button>
+</form>
+{{template "foot" .}}{{end}}
+
+{{define "join"}}{{template "head" .}}
+<form class="card" method="post" action="/join">
+  <h1>reMarkable Live</h1>
+  {{if .Error}}
+    <p class="sub">You have been invited to watch a reMarkable screen.</p>
+    <p class="err">{{.Error}}</p>
+    <p class="muted">Ask the person who invited you for a new link.</p>
+  {{else}}
+    <p class="sub">You have been invited to watch a reMarkable screen as <strong>{{.Invite.Label}}</strong>.</p>
+    <p class="muted">The invitation expires {{until .Invite.Expires}}. You can watch, but not draw on the tablet.</p>
+    {{if .SignedIn}}<p class="muted">You are already signed in as <strong>{{.Session.Label}}</strong>. Joining replaces that session in this browser.</p>{{end}}
+    <input type="hidden" name="token" value="{{.Token}}">
+    <button type="submit">Join and watch</button>
+  {{end}}
+</form>
+{{template "foot" .}}{{end}}
+
+{{define "invites"}}{{template "head" .}}
+<div class="card wide">
+  <h1>Invitations</h1>
+  <p class="sub">Invite links let other people watch the screen without the password. They only watch; they cannot draw. Access ends when the link expires or when you revoke it.</p>
+  {{if .Error}}<p class="err">{{.Error}}</p>{{end}}
+
+  {{if .NewLink}}
+  <div class="new">
+    <strong>New link for {{.NewInvite.Label}}</strong> (valid until {{when .NewInvite.Expires}}, {{until .NewInvite.Expires}}).<br>
+    <span class="muted">It is shown only once. Anyone who opens it can watch until it expires or you revoke it.</span>
+    <div class="row" style="margin-top:10px">
+      <label style="flex:1 1 240px"><input type="text" id="newLink" value="{{.NewLink}}" readonly onclick="this.select()"></label>
+      <button type="button" class="small quiet" onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('newLink').value).then(()=>{this.textContent='Copied'})">Copy</button>
+    </div>
+    {{if .NewLinkQR}}<img src="{{.NewLinkQR}}" alt="QR code of the invite link">{{end}}
+  </div>
+  {{end}}
+
+  <h2>Create an invite link</h2>
+  <form method="post" action="/invites" autocomplete="off">
+    <input type="hidden" name="csrf" value="{{.Session.CSRF}}">
+    <input type="hidden" name="action" value="create">
+    <div class="row">
+      <label>Who is it for
+        <input type="text" name="label" placeholder="e.g. Anna, Tuesday class" maxlength="40">
+      </label>
+      <label>Valid for
+        <select name="lifetime">
+          {{range .Lifetimes}}<option value="{{.D}}"{{if eq .D $.DefaultLifetime}} selected{{end}}>{{.Label}}</option>{{end}}
+        </select>
+      </label>
+      <button type="submit">Create link</button>
+    </div>
+  </form>
+
+  <h2>Active invitations</h2>
+  {{if .Invites}}
+  <div class="scroll"><table>
+    <tr><th>For</th><th>Created</th><th>Expires</th><th>Joined</th><th></th></tr>
+    {{range .Invites}}
+    <tr>
+      <td>{{.Label}}</td>
+      <td class="muted">{{when .Created}}</td>
+      <td>{{when .Expires}} <span class="muted">({{until .Expires}})</span></td>
+      <td>{{.Joined}}</td>
+      <td><form method="post" action="/invites"><input type="hidden" name="csrf" value="{{$.Session.CSRF}}"><input type="hidden" name="action" value="revoke"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small quiet">Revoke</button></form></td>
+    </tr>
+    {{end}}
+  </table></div>
+  {{else}}<p class="muted">No invitations yet.</p>{{end}}
+
+  <h2>Who is signed in</h2>
+  <div class="scroll"><table>
+    <tr><th>Who</th><th>From</th><th>Signed in</th><th>Last seen</th><th>Expires</th><th></th></tr>
+    {{range .Sessions}}
+    <tr>
+      <td>{{.Label}}{{if eq .ID $.Session.ID}} <span class="muted">(this browser)</span>{{end}}</td>
+      <td class="muted">{{.IP}}</td>
+      <td class="muted">{{when .Created}}</td>
+      <td class="muted">{{ago .LastSeen}}</td>
+      <td class="muted">{{until .Expires}}</td>
+      <td><form method="post" action="/invites"><input type="hidden" name="csrf" value="{{$.Session.CSRF}}"><input type="hidden" name="action" value="end-session"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small quiet">{{if eq .ID $.Session.ID}}Log out{{else}}Sign out{{end}}</button></form></td>
+    </tr>
+    {{end}}
+  </table></div>
+
+  <p class="links"><a href="/">← back to the preview</a> · <a href="/url">current URL</a></p>
+</div>
+{{template "foot" .}}{{end}}

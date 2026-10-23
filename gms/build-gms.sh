@@ -7,6 +7,7 @@
 #   client_orientation.patch   auto-rotate the preview with the tablet
 #   stream_idle_refresh.patch  keep refreshing the picture without pen input
 #   client_pen.patch           draw on the tablet from the browser (remote pen)
+#   client_roles.patch         owner/guest roles: hide Draw for guests, Invite button
 #
 #   gms/build-gms.sh <arm|arm64> <output-file>
 set -eu
