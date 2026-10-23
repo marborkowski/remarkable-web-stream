@@ -63,15 +63,17 @@ func TestFindFont(t *testing.T) {
 }
 
 func TestDrawJobValidate(t *testing.T) {
-	ok := drawJob{Text: "\n\u2028 A -> B", Strokes: [][]float64{{0.1, 0.1, 0.2, 0.2}}}
+	minusOne, three := -1, 3
+	ok := drawJob{Text: "\n\u2028 A -> B", PagesUp: &three, Strokes: [][]float64{{0.1, 0.1, 0.2, 0.2}}}
 	if err := ok.validate(); err != nil {
 		t.Errorf("valid job: %v", err)
 	}
 	for name, j := range map[string]drawJob{
-		"odd coordinates": {Strokes: [][]float64{{0.1, 0.2, 0.3}}},
-		"empty stroke":    {Strokes: [][]float64{{}}},
-		"untypeable":      {Text: "[x]"},
-		"too long":        {Text: strings.Repeat("a", maxDrawText+1)},
+		"odd coordinates":  {Strokes: [][]float64{{0.1, 0.2, 0.3}}},
+		"empty stroke":     {Strokes: [][]float64{{}}},
+		"untypeable":       {Text: "[x]"},
+		"too long":         {Text: strings.Repeat("a", maxDrawText+1)},
+		"negative pagesUp": {PagesUp: &minusOne},
 	} {
 		if err := j.validate(); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -150,5 +152,15 @@ func TestLeadIn(t *testing.T) {
 	}
 	if dot := leadIn([]float64{0.3, 0.3}); dot[0][0] != 0.3 || dot[0][1] >= 0.3 {
 		t.Errorf("dot lead-in starts at %v, want above (0.3, 0.3)", dot[0])
+	}
+}
+
+func TestParseCPUTicks(t *testing.T) {
+	stat := "350 (xochitl (main)) S 1 350 350 0 -1 4194560 81024 0 0 0 1234 567 0 0 20 0 30 0 1500 900000000 50000"
+	if n, ok := parseCPUTicks(stat); !ok || n != 1234+567 {
+		t.Errorf("got %d, %v; want %d", n, ok, 1234+567)
+	}
+	if _, ok := parseCPUTicks("garbage"); ok {
+		t.Error("parsed garbage")
 	}
 }

@@ -34,21 +34,35 @@ const (
 	keyboardLinger = 500 * time.Millisecond  // let xochitl process the last keys before unplugging
 	keyHold        = 4 * time.Millisecond
 	keyGap         = 8 * time.Millisecond
+	// Around a dead key and the letter it composes. Without it xochitl,
+	// which lags behind fast typing, sometimes puts the composed letter
+	// before the letters typed just ahead of it ("Zaómwienie").
+	deadKeyPause = 60 * time.Millisecond
+	typeBatch    = 5 // keys
+	batchPoll    = 30 * time.Millisecond
+	batchWait    = 3 * time.Second
 )
 
 const (
 	key4         = 5
 	keyEnter     = 28
 	keyLeftCtrl  = 29
+	keyA         = 30
 	keyLeftShift = 42
 	keySpace     = 57
-	keyEnd       = 107
+	keyPageUp    = 104
+	keyRight     = 106
 )
 
 // keyStroke is one key press, possibly with Shift held.
 type keyStroke struct {
 	code  uint16
 	shift bool
+}
+
+// isDead reports whether k is one of the dead keys below.
+func (k keyStroke) isDead() bool {
+	return k.code == 26 || k.code == 27 || (k.code == 7 && k.shift)
 }
 
 var (
@@ -262,26 +276,17 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// newParagraph starts a Body paragraph after the page's text: Ctrl+End,
-// Enter, then Ctrl+4 (Body text) because a new paragraph keeps the style of
-// the one before it, e.g. the Title that xochitl starts an empty page with.
-var newParagraph = []struct {
-	key  keyStroke
-	ctrl bool
-}{
-	{keyStroke{keyEnd, false}, true},
-	{keyStroke{keyEnter, false}, false},
-	{keyStroke{key4, false}, true},
-}
-
-// typeText plugs in the virtual keyboard, types text as a new paragraph
-// after the page's text and unplugs the keyboard. progress is called after
-// every key press.
-func (k *virtualKeyboard) typeText(ctx context.Context, text string, progress func(done, total int)) error {
-	strokes, err := keystrokes(text)
-	if err != nil {
-		return err
-	}
+// session plugs in the virtual keyboard, waits for xochitl to pick it up,
+// puts the cursor at the end of the page's text, runs fn and unplugs the
+// keyboard.
+//
+// The first key puts xochitl in text mode, and the keys right after it are
+// lost, so it is a harmless Right followed by a pause. xochitl has no key for
+// the end of the text (Ctrl+End does nothing), so the session selects all
+// (Ctrl+A) and collapses the selection to its end (Right). That scrolls the
+// page only if the cursor moves: after typing, which leaves the cursor at the
+// end, the page stays where it is.
+func (k *virtualKeyboard) session(ctx context.Context, fn func(dev *uinputDevice) error) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	dev, err := createKeyboard(k.path)
@@ -289,28 +294,101 @@ func (k *virtualKeyboard) typeText(ctx context.Context, text string, progress fu
 		return err
 	}
 	defer dev.destroy()
-	log.Printf("virtual keyboard: typing %d keys", len(strokes))
 	if err := sleepCtx(ctx, keyboardSettle); err != nil {
 		return err
 	}
-	for i, p := range newParagraph {
-		if p.ctrl {
-			dev.press(p.key, keyLeftCtrl)
-		} else {
-			dev.press(p.key)
-		}
-		if i == 0 {
-			if err := sleepCtx(ctx, textModeSettle); err != nil {
-				return err
-			}
-		}
+	dev.press(keyStroke{keyRight, false})
+	if err := sleepCtx(ctx, textModeSettle); err != nil {
+		return err
 	}
-	for i, s := range strokes {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		dev.press(s)
-		progress(i+1, len(strokes))
+	dev.press(keyStroke{keyA, false}, keyLeftCtrl)
+	dev.press(keyStroke{keyRight, false})
+	if err := fn(dev); err != nil {
+		return err
 	}
 	return sleepCtx(ctx, keyboardLinger)
+}
+
+// typeText types text as a new paragraph after the page's text. progress is
+// called after every key press.
+//
+// The keys go in small batches, each once xochitl has handled the one
+// before: it lays text out more slowly than keys arrive, the more slowly
+// the longer the text, and the kernel keeps only 64 input events (about 16
+// keys) for it, dropping the rest.
+func (k *virtualKeyboard) typeText(ctx context.Context, text string, progress func(done, total int)) error {
+	strokes, err := keystrokes(text)
+	if err != nil {
+		return err
+	}
+	log.Printf("virtual keyboard: typing %d keys", len(strokes))
+	xochitl := findProcess("xochitl")
+	return k.session(ctx, func(dev *uinputDevice) error {
+		// Enter, then Ctrl+4 (Body text): a new paragraph keeps the style
+		// of the one before it, e.g. the Title an empty page starts with.
+		dev.press(keyStroke{keyEnter, false})
+		dev.press(keyStroke{key4, false}, keyLeftCtrl)
+		for i, s := range strokes {
+			if i%typeBatch == 0 && !(i > 0 && strokes[i-1].isDead()) {
+				if err := caughtUp(ctx, xochitl); err != nil {
+					return err
+				}
+			}
+			composing := s.isDead() || (i > 0 && strokes[i-1].isDead())
+			if s.isDead() {
+				time.Sleep(deadKeyPause)
+			}
+			dev.press(s)
+			if composing && !s.isDead() {
+				time.Sleep(deadKeyPause)
+			}
+			progress(i+1, len(strokes))
+		}
+		return nil
+	})
+}
+
+// scrollUp presses Page Up pages times, which in text mode scrolls the page
+// up by 80 % of the screen each time (outside it, by more). This is how a
+// drawing job reaches the parts of a diagram taller than the screen, from
+// the bottom up: typing leaves the page at the end of the text.
+func (k *virtualKeyboard) scrollUp(ctx context.Context, pages int) error {
+	return k.session(ctx, func(dev *uinputDevice) error {
+		for i := 0; i < pages; i++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			dev.press(keyStroke{keyPageUp, false})
+		}
+		return nil
+	})
+}
+
+// caughtUp waits until xochitl has handled the keys sent so far, that is
+// until it used (almost) no CPU time in two short polls in a row, at most
+// batchWait. Without the process (tests) it only pauses.
+func caughtUp(ctx context.Context, pid string) error {
+	if pid == "" {
+		return sleepCtx(ctx, batchPoll)
+	}
+	prev, ok := cpuTicks(pid)
+	quiet := 0
+	for start := time.Now(); ok && time.Since(start) < batchWait; {
+		if err := sleepCtx(ctx, batchPoll); err != nil {
+			return err
+		}
+		var cur int64
+		if cur, ok = cpuTicks(pid); !ok {
+			break
+		}
+		if cur-prev <= 1 {
+			if quiet++; quiet == 2 {
+				return nil
+			}
+		} else {
+			quiet = 0
+		}
+		prev = cur
+	}
+	return nil
 }

@@ -145,14 +145,14 @@ Other behaviour to know about:
 
 ### Drawing Mermaid diagrams
 
-1. On the tablet, open an **empty page** in **portrait**, not zoomed, and pick the **fineliner** (other tools work, but the fineliner gives the cleanest lines).
+1. On the tablet, open a page in **portrait**, not zoomed, and pick the **fineliner** (other tools work, but the fineliner gives the cleanest lines). An empty page is best; on a page with text, the diagram goes below it.
 2. In the viewer, press **Mermaid**, then paste or write the diagram. The preview on the right shows the page as it will look: the blue text is what will be typed.
-3. Press **Draw on the tablet** and leave the tablet alone until the dialog says *Done* (about 20–30 s for a small diagram).
+3. Press **Draw on the tablet** and leave the tablet alone until the dialog says *Done*. That takes about half a minute for a small diagram and a few minutes for one several screens tall.
 
-The labels are typed as **real text**, through a virtual keyboard that the proxy plugs in for the duration of the job. xochitl's text is one flowing document per page, so labels cannot go just anywhere: they go on its lines, moved right with spaces, and the diagram is stretched vertically so that every label sits on a line. After typing, the viewer finds the text on a screenshot and draws the boxes and arrows around it with the pen. Details are in [docs/how-it-works.md](docs/how-it-works.md#mermaid-diagrams).
+The labels are typed as **real text**, through a virtual keyboard that the proxy plugs in for the duration of the job. xochitl's text is one flowing document per page, so labels cannot go just anywhere: they go on its lines, moved right with spaces, and the diagram is stretched vertically so that every label sits on a line. After typing, the viewer finds the text on a screenshot and draws the boxes and arrows around it with the pen. A diagram taller than the screen is drawn in parts from the bottom up: the tablet scrolls the page with Page Up between them. Details are in [docs/how-it-works.md](docs/how-it-works.md#mermaid-diagrams).
 
 Limitations:
-- **Size.** The text uses the tablet's body size (32 px), so a diagram is drawn at the size Mermaid would draw it with that font. It must fit the page and its labels must fit one line of text (about 1140 px wide); otherwise the dialog says so before anything is drawn. `flowchart TD` usually fits better than `LR`.
+- **Size.** The text uses the tablet's body size (32 px), so a diagram is drawn at the size Mermaid would draw it with that font. Its height is not limited: a tall diagram is drawn in parts, scrolling in between. Its width is: the labels must fit one line of text (about 1140 px). A diagram that is too wide is laid out more compactly, and a left-to-right flowchart is turned top to bottom; if it still does not fit, the dialog says so before anything is drawn. A tall diagram also needs labels on every screen (the viewer finds the page by them).
 - **Characters.** The virtual keyboard has the tablet's US layout: `[ ] { }` become `( )`, and letters without a dead key on that layout lose their accent (`ą ę ł ż` → `a e l z`; `ć ń ó ś ź é ä ü` and similar stay).
 - **Diagram types.** Flowcharts, sequence, class, state and ER diagrams work well. Rotated labels and parts that Mermaid renders as HTML are left out, and labels that Mermaid draws in another font size may not fit their boxes; the dialog warns about all of these.
 - **The drawing follows the text.** xochitl anchors strokes to the text near them, so if you later type above the diagram or edit its labels, the lines move with the text and may no longer match. The typed text is one paragraph you can undo or delete like any other.

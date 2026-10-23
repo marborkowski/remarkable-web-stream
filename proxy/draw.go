@@ -11,6 +11,8 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,14 +34,18 @@ import (
 //
 //	GET  /draw/info   {"chars": "<characters the keyboard can type>", "keyboard": true}
 //	GET  /draw/font   the font xochitl uses for typed text
-//	POST /draw        {"text": "...", "strokes": [[x0, y0, x1, y1, ...], ...]}
+//	POST /draw        {"text": "...", "pagesUp": n, "strokes": [[x0, y0, x1, y1, ...], ...]}
 //
-// The text is typed as a new paragraph after the page's text: "\n" starts
-// another paragraph, U+2028 (LINE SEPARATOR) another line of the same
-// paragraph. Stroke coordinates are normalised to 0..1 in the native portrait
-// screen space, like the /pen protocol. POST /draw streams its progress as JSON
-// lines ({"phase": "typing"|"drawing", "done": n, "total": m}) and ends with
-// {"ok": true} or {"error": "..."}. Closing the request stops the job.
+// Each part is optional and they run in this order. The text is typed as a
+// new paragraph after the page's text: "\n" starts another paragraph, U+2028
+// (LINE SEPARATOR) another line of the same paragraph; typing leaves the page
+// scrolled to the end of the text. pagesUp presses Page Up n times, 80 % of
+// the screen each: a diagram taller than the screen is drawn in parts from
+// the bottom up, scrolling in between. Stroke coordinates are normalised to 0..1 of
+// the screen as it is (native portrait), like the /pen protocol. POST /draw
+// streams its progress as JSON lines ({"phase": "typing"|"waiting"|"drawing",
+// "done": n, "total": m}) and ends with {"ok": true} or {"error": "..."}. Closing the
+// request stops the job.
 const (
 	penPointInterval = 4 * time.Millisecond  // between pen samples (a real pen reports at a few hundred Hz)
 	penRest          = 20 * time.Millisecond // still before lifting, or xochitl clips the end of the stroke
@@ -48,6 +54,9 @@ const (
 	leadInStep       = 0.0018                // ...in steps of about 3 px (normalised width units)
 	maxDrawText      = 20000                 // characters per job
 	maxDrawPoints    = 200000                // pen samples per job
+	maxPagesUp       = 100
+	idleTimeout      = 2 * time.Minute
+	idleTicks        = 10 // xochitl's CPU time per 0.5 s (in 1/100 s) below which it is idle: a fifth of a core
 	maxDrawBody      = 8 << 20
 )
 
@@ -56,6 +65,7 @@ const textFontName = "reMarkable Sans Regular"
 
 type drawJob struct {
 	Text    string      `json:"text"`
+	PagesUp *int        `json:"pagesUp"`
 	Strokes [][]float64 `json:"strokes"`
 }
 
@@ -65,6 +75,9 @@ func (j *drawJob) validate() error {
 	}
 	if _, err := keystrokes(j.Text); err != nil {
 		return err
+	}
+	if j.PagesUp != nil && (*j.PagesUp < 0 || *j.PagesUp > maxPagesUp) {
+		return errors.New("pagesUp out of range")
 	}
 	points := 0
 	for _, s := range j.Strokes {
@@ -149,7 +162,7 @@ func (d *drawer) run(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if job.Text != "" && d.kb == nil {
+	if (job.Text != "" || job.PagesUp != nil) && d.kb == nil {
 		http.Error(w, "typing is disabled (-keyboard-device)", http.StatusServiceUnavailable)
 		return
 	}
@@ -174,16 +187,21 @@ func (d *drawer) run(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var last time.Time
+	var lastPhase string
 	progress := func(phase string) func(done, total int) {
 		return func(done, total int) {
-			if done == total || time.Since(last) > 250*time.Millisecond {
-				last = time.Now()
+			if phase != lastPhase || done == total || time.Since(last) > 250*time.Millisecond {
+				last, lastPhase = time.Now(), phase
 				send(map[string]any{"phase": phase, "done": done, "total": total})
 			}
 		}
 	}
 
-	log.Printf("draw: job from %s: %d characters, %d strokes", clientIP(r), len([]rune(job.Text)), len(job.Strokes))
+	up := "-"
+	if job.PagesUp != nil {
+		up = fmt.Sprint(*job.PagesUp)
+	}
+	log.Printf("draw: job from %s: %d characters, %s pages up, %d strokes", clientIP(r), len([]rune(job.Text)), up, len(job.Strokes))
 	err := d.execute(r.Context(), &job, progress)
 	if err != nil {
 		log.Printf("draw: %v", err)
@@ -198,6 +216,17 @@ func (d *drawer) execute(ctx context.Context, job *drawJob, progress func(phase 
 		if err := d.kb.typeText(ctx, job.Text, progress("typing")); err != nil {
 			return err
 		}
+	}
+	if job.PagesUp != nil {
+		if err := d.kb.scrollUp(ctx, *job.PagesUp); err != nil {
+			return err
+		}
+	}
+	// xochitl lays typed text out much more slowly than the keys arrive,
+	// and drops pen input while it is busy: wait until it has caught up.
+	progress("waiting")(0, 1)
+	if err := waitIdle(ctx); err != nil {
+		return err
 	}
 	if len(job.Strokes) == 0 {
 		return nil
@@ -271,6 +300,74 @@ func leadIn(s []float64) [][2]float64 {
 		out = append(out, [2]float64{clamp01(x0 - dx*d), clamp01(y0 - dy*d*3/4)})
 	}
 	return out
+}
+
+// waitIdle returns once xochitl has used less than idleTicks of CPU time in
+// two half-second periods in a row, or after idleTimeout.
+func waitIdle(ctx context.Context) error {
+	pid := findProcess("xochitl")
+	if pid == "" {
+		return nil
+	}
+	prev, ok := cpuTicks(pid)
+	quiet := 0
+	for deadline := time.Now().Add(idleTimeout); ok && time.Now().Before(deadline); {
+		if err := sleepCtx(ctx, 500*time.Millisecond); err != nil {
+			return err
+		}
+		var cur int64
+		if cur, ok = cpuTicks(pid); !ok {
+			break
+		}
+		if cur-prev < idleTicks {
+			quiet++
+		} else {
+			quiet = 0
+		}
+		if quiet == 2 {
+			return nil
+		}
+		prev = cur
+	}
+	log.Printf("draw: xochitl did not become idle")
+	return nil
+}
+
+// findProcess returns the PID of the process called name, or "".
+func findProcess(name string) string {
+	entries, _ := os.ReadDir("/proc")
+	for _, e := range entries {
+		if comm, err := os.ReadFile("/proc/" + e.Name() + "/comm"); err == nil && strings.TrimSpace(string(comm)) == name {
+			return e.Name()
+		}
+	}
+	return ""
+}
+
+// cpuTicks returns the CPU time a process has used (user + system, in
+// clock ticks), from /proc/<pid>/stat.
+func cpuTicks(pid string) (int64, bool) {
+	b, err := os.ReadFile("/proc/" + pid + "/stat")
+	if err != nil {
+		return 0, false
+	}
+	return parseCPUTicks(string(b))
+}
+
+func parseCPUTicks(stat string) (int64, bool) {
+	// The command name in parentheses may contain spaces; fields 14 and 15
+	// (utime, stime) follow it.
+	i := strings.LastIndexByte(stat, ')')
+	if i < 0 {
+		return 0, false
+	}
+	f := strings.Fields(stat[i+1:])
+	if len(f) < 13 {
+		return 0, false
+	}
+	u, err1 := strconv.ParseInt(f[11], 10, 64)
+	s, err2 := strconv.ParseInt(f[12], 10, 64)
+	return u + s, err1 == nil && err2 == nil
 }
 
 // ---------------------------------------------------------------------------

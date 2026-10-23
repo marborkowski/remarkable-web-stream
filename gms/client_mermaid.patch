@@ -26,7 +26,7 @@
 \ No newline at end of file
 --- /dev/null
 +++ b/client/mermaid.js
-@@ -0,0 +1,1065 @@
+@@ -0,0 +1,1246 @@
 +// ---------------------------------------------------------------------------
 +// Mermaid import: redraw a Mermaid diagram on the tablet.
 +//
@@ -41,9 +41,10 @@
 +// apart), moved right with spaces. The diagram is stretched vertically so
 +// that every label sits on a line, and its strokes follow.
 +//
-+// A drawing job: screenshot, type the text (POST /draw), screenshot again,
-+// find the typed text in the difference, then draw the strokes at the place
-+// where the text actually landed (POST /draw).
++// A drawing job: type the text (POST /draw), find it on a screenshot, then
++// draw the strokes where the text actually landed (POST /draw). A diagram
++// taller than the screen is drawn in parts from the bottom up, scrolling the
++// page with Page Up in between.
 +// ---------------------------------------------------------------------------
 +(function () {
 +    'use strict';
@@ -58,15 +59,17 @@
 +        columnWidth: 1140,   // a line longer than this wraps
 +        firstBaseline: 367.5 // first Body line of a page (under the empty Title line)
 +    };
-+    // Strokes stay clear of the toolbar and of the paragraph menu xochitl
-+    // shows left of the text, where a pen touch is a tap on a button.
-+    const PAGE_MARGIN = { left: 210, top: 150, right: 20, bottom: 40 };
++    // Strokes stay clear of the toolbar, the close button at the top and the
++    // paragraph menu xochitl shows left of the text, where a pen touch is a
++    // tap on a button.
++    const PAGE_MARGIN = { left: 210, top: 120, right: 20, bottom: 30 };
 +    // xochitl maps the pen onto the 1620x2160 panel of the Paper Pro, while
 +    // its framebuffer is 1632x2154: screen x = 1620/1632 * pen x + 3.2,
 +    // screen y = 2160/2154 * pen y - 0.7 (measured).
 +    const PEN_MAP = screenWidth === 1632 && screenHeight === 2154
 +        ? { sx: 1620 / 1632, ox: 3.2, sy: 2160 / 2154, oy: -0.7 }
 +        : { sx: 1, ox: 0, sy: 1, oy: 0 };
++    const PAGE_STEP = 0.804;   // of the screen: how far Page Up scrolls (measured)
 +    const ROW_TOLERANCE = 12;  // px: labels this close vertically share a text line
 +    const SAMPLE_STEP = 2;     // px between samples of an outline
 +    // px between pen samples. The proxy sends one every 4 ms, so this sets the
@@ -125,46 +128,62 @@
 +                if (!window.mermaid) {
 +                    await loadScript(MERMAID_SRC);
 +                }
-+                const f = TEXT.font;
-+                window.mermaid.initialize({
-+                    startOnLoad: false,
-+                    securityLevel: 'strict',
-+                    suppressErrorRendering: true,
-+                    theme: 'base',
-+                    htmlLabels: false,
-+                    fontFamily: f,
-+                    fontSize: TEXT.size, // some diagram types take their font size from here
-+                    themeVariables: {
-+                        fontFamily: f,
-+                        fontSize: TEXT.size + 'px',
-+                        background: '#ffffff',
-+                        primaryColor: '#ffffff',
-+                        primaryTextColor: '#000000',
-+                        primaryBorderColor: '#000000',
-+                        secondaryColor: '#ffffff',
-+                        tertiaryColor: '#ffffff',
-+                        lineColor: '#000000',
-+                        textColor: '#000000',
-+                        clusterBkg: '#ffffff',
-+                        clusterBorder: '#000000',
-+                        edgeLabelBackground: '#ffffff'
-+                    },
-+                    // Twice the default font, so labels wrap at about twice the width.
-+                    flowchart: { htmlLabels: false, useMaxWidth: false, wrappingWidth: 360 },
-+                    sequence: {
-+                        useMaxWidth: false, mirrorActors: false,
-+                        actorFontFamily: f, actorFontSize: TEXT.size,
-+                        noteFontFamily: f, noteFontSize: TEXT.size,
-+                        messageFontFamily: f, messageFontSize: TEXT.size
-+                    },
-+                    class: { htmlLabels: false, useMaxWidth: false },
-+                    state: { useMaxWidth: false },
-+                    er: { useMaxWidth: false, fontSize: TEXT.size }
-+                });
 +            })();
 +            loading.catch(() => { loading = null; });
 +        }
 +        return loading;
++    }
++
++    // Layouts tried in turn until the labels fit a line of the tablet's text:
++    // Mermaid's own spacing, then tighter spacing and narrower labels. The
++    // wrapping widths are for text twice Mermaid's default size.
++    const COMPACT = [
++        { spacing: 1, wrap: 360, actor: 150 },
++        { spacing: 0.6, wrap: 260, actor: 110 },
++        { spacing: 0.35, wrap: 180, actor: 80 }
++    ];
++
++    function mermaidConfig(c) {
++        const f = TEXT.font;
++        const gap = v => Math.round(v * c.spacing);
++        return {
++            startOnLoad: false,
++            securityLevel: 'strict',
++            suppressErrorRendering: true,
++            theme: 'base',
++            htmlLabels: false,
++            fontFamily: f,
++            fontSize: TEXT.size, // some diagram types take their font size from here
++            themeVariables: {
++                fontFamily: f,
++                fontSize: TEXT.size + 'px',
++                background: '#ffffff',
++                primaryColor: '#ffffff',
++                primaryTextColor: '#000000',
++                primaryBorderColor: '#000000',
++                secondaryColor: '#ffffff',
++                tertiaryColor: '#ffffff',
++                lineColor: '#000000',
++                textColor: '#000000',
++                clusterBkg: '#ffffff',
++                clusterBorder: '#000000',
++                edgeLabelBackground: '#ffffff'
++            },
++            flowchart: {
++                htmlLabels: false, useMaxWidth: false, wrappingWidth: c.wrap,
++                nodeSpacing: gap(50), rankSpacing: gap(50)
++            },
++            sequence: {
++                useMaxWidth: false,
++                actorMargin: gap(50), width: c.actor, boxMargin: gap(10),
++                actorFontFamily: f, actorFontSize: TEXT.size,
++                noteFontFamily: f, noteFontSize: TEXT.size,
++                messageFontFamily: f, messageFontSize: TEXT.size
++            },
++            class: { htmlLabels: false, useMaxWidth: false, nodeSpacing: gap(50), rankSpacing: gap(50) },
++            state: { useMaxWidth: false, nodeSpacing: gap(50), rankSpacing: gap(50) },
++            er: { useMaxWidth: false, fontSize: TEXT.size, nodeSpacing: gap(140), rankSpacing: gap(80) }
++        };
 +    }
 +
 +    function measure(s) {
@@ -184,7 +203,7 @@
 +        'ł': 'l', 'Ł': 'L', 'ß': 'ss', 'æ': 'ae', 'Æ': 'AE', 'ø': 'o', 'Ø': 'O', 'đ': 'd', 'Đ': 'D',
 +        '‘': "'", '’': "'", '‚': ',', '“': '"', '”': '"', '„': '"', '«': '"', '»': '"',
 +        '–': '-', '—': '-', '−': '-', '…': '...', '•': '*', '·': '*', '×': 'x', '→': '->', '←': '<-',
-+        ' ': ' ', '\t': ' '
++        '\u00a0': ' ', '\t': ' '
 +    };
 +
 +    // sanitize returns s with every character the tablet keyboard cannot type
@@ -199,7 +218,7 @@
 +            }
 +            let r = REPLACEMENTS[ch];
 +            if (r === undefined) {
-+                r = ch.normalize('NFD').replace(/[̀-ͯ]/g, '');
++                r = ch.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 +            }
 +            out += Array.from(r).every(c => typeable.has(c)) ? r : '?';
 +        }
@@ -602,9 +621,11 @@
 +    // Layout on the lines of the tablet's text
 +    // ---------------------------------------------------------------------
 +
-+    function fail(message) {
-+        const e = new Error(message);
-+        e.layout = true;
++    // tooWide reports labels that do not fit a line of the tablet's text;
++    // makePlan then tries a more compact layout.
++    function tooWide(span) {
++        const e = new Error(`The diagram is too wide for the tablet's text, even laid out compactly: its labels span ${Math.round(span)} px, a line holds ${TEXT.columnWidth} px. Shorten the labels or split the diagram.`);
++        e.wide = true;
 +        throw e;
 +    }
 +
@@ -619,7 +640,7 @@
 +            warnings.push('Characters the tablet keyboard cannot type were replaced (e.g. ą → a, [ → ().');
 +        }
 +        for (const l of labels) l.width = measure(l.text);
-+        if (!diagram.strokes.length && !labels.length) fail('The diagram is empty.');
++        if (!diagram.strokes.length && !labels.length) throw new Error('The diagram is empty.');
 +
 +        // Labels whose baselines are close share a text line, unless they overlap.
 +        labels.sort((a, b) => a.baseline - b.baseline || a.x - b.x);
@@ -654,18 +675,14 @@
 +        if (labels.length) {
 +            const [left] = extent([labels], l => l.x);
 +            const [, right] = extent([labels], l => l.x + l.width);
-+            if (right - left > TEXT.columnWidth - 2 * space) {
-+                fail(`The diagram is too wide for the tablet's text: its labels span ${Math.round(right - left)} px, a line holds ${TEXT.columnWidth} px. Try "flowchart TD" or shorter labels.`);
-+            }
++            if (right - left > TEXT.columnWidth - 2 * space) tooWide(right - left);
 +            tx = TEXT.left + (TEXT.columnWidth - (right - left)) / 2 - left;
 +            if (minX + tx < PAGE_MARGIN.left) {
 +                tx = PAGE_MARGIN.left - minX;
 +            } else if (maxX + tx > screenWidth - PAGE_MARGIN.right) {
 +                tx = screenWidth - PAGE_MARGIN.right - maxX;
 +            }
-+            if (left + tx < TEXT.left - 0.5 || right + tx > TEXT.left + TEXT.columnWidth) {
-+                fail('The diagram does not fit on the page next to the toolbar. Try "flowchart TD" or shorter labels.');
-+            }
++            if (left + tx < TEXT.left - 0.5 || right + tx > TEXT.left + TEXT.columnWidth) tooWide(maxX - minX);
 +        } else {
 +            tx = (screenWidth - maxX - minX) / 2;
 +        }
@@ -688,9 +705,9 @@
 +        };
 +        let offset = 0;
 +        let warp = warpWith(0);
-+        const [top] = extent(diagram.strokes, p => warp(p.y));
-+        if (rows.length && top < PAGE_MARGIN.top) {
-+            offset = Math.ceil((PAGE_MARGIN.top - top) / P);
++        const [highest] = extent(diagram.strokes, p => warp(p.y));
++        if (rows.length && highest < PAGE_MARGIN.top) {
++            offset = Math.ceil((PAGE_MARGIN.top - highest) / P);
 +            warp = warpWith(offset);
 +        }
 +
@@ -721,9 +738,7 @@
 +                });
 +                line += l.text;
 +            }
-+            if (measure(line) > TEXT.columnWidth) {
-+                fail('A line of labels is too wide for the tablet\'s text. Try "flowchart TD" or shorter labels.');
-+            }
++            if (measure(line) > TEXT.columnWidth) tooWide(measure(line));
 +            lines.push(line);
 +        }
 +
@@ -736,21 +751,65 @@
 +        strokes = strokes
 +            .flatMap(line => penStrokes(simplify(line, 0.35)))
 +            .filter(line => line.length > 1 && length(line) >= 3); // drop specks left by the cuts
-+        const [, bottom] = extent(strokes, p => p.y);
-+        if (bottom > screenHeight - PAGE_MARGIN.bottom) {
-+            fail(`The diagram is too tall for the page: it needs ${Math.round(bottom - TEXT.firstBaseline)} px below the first line, the page has ${Math.round(screenHeight - PAGE_MARGIN.bottom - TEXT.firstBaseline)} px. Try "flowchart LR" or fewer nodes.`);
++        // A diagram taller than the screen is drawn in parts, scrolling the
++        // page with the text cursor in between (drawOnTablet). That needs
++        // labels on every screen, to find where the page is.
++        const [top, bottom] = extent(strokes, p => p.y);
++        const tall = bottom > screenHeight - PAGE_MARGIN.bottom;
++        if (tall) {
++            const screen = screenHeight - PAGE_MARGIN.top - PAGE_MARGIN.bottom - 300;
++            const ys = lines.map((t, i) => t.trim() ? TEXT.firstBaseline + (i + 1) * P : null).filter(y => y !== null);
++            const gaps = [ys[0] - top, bottom - ys[ys.length - 1]];
++            for (let i = 1; i < ys.length; i++) gaps.push(ys[i] - ys[i - 1]);
++            if (!ys.length || Math.max(...gaps) > screen) {
++                throw new Error('The diagram is taller than the screen and has a part taller than the screen without any labels. The tablet scrolls by its text, so it cannot draw that part.');
++            }
 +        }
++        // Empty lines below the last row, so that the text cursor at the end
++        // scrolls the bottom of the diagram into view (xochitl keeps about a
++        // sixth of the screen below the cursor).
++        const lastLine = TEXT.firstBaseline + lines.length * P;
++        for (let i = Math.ceil((bottom - lastLine - 250) / P); i > 0; i--) lines.push('');
 +
 +        return {
 +            text: lines.length ? '\u2028' + lines.join('\u2028') : '',
 +            rows: lines.map((t, i) => ({ text: t, baseline: TEXT.firstBaseline + (i + 1) * P })),
 +            strokes,
++            top,
++            bottom,
++            tall,
 +            warnings
 +        };
 +    }
 +
++    // makePlan lays the diagram out for the tablet, more compactly if its
++    // labels do not fit a line of text, and as a last resort turns a
++    // left-to-right flowchart top-to-bottom.
 +    async function makePlan(source) {
 +        await load();
++        const attempts = COMPACT.map(c => ({ source, compact: c }));
++        const turned = source.replace(/^(\s*(?:flowchart|graph)\s+)(LR|RL)\b/m, '$1TB');
++        if (turned !== source) attempts.push(...COMPACT.map(c => ({ source: turned, compact: c, turned: true })));
++        let wide = null;
++        for (const a of attempts) {
++            try {
++                const p = await render(a.source, a.compact);
++                if (a.turned) {
++                    p.warnings.unshift('Drawn top to bottom: left to right it is too wide for the tablet\'s text.');
++                } else if (a.compact !== COMPACT[0]) {
++                    p.warnings.unshift('Laid out more compactly than Mermaid would, to fit a line of the tablet\'s text.');
++                }
++                return p;
++            } catch (e) {
++                if (!e.wide) throw e;
++                wide = e;
++            }
++        }
++        throw wide;
++    }
++
++    async function render(source, compact) {
++        window.mermaid.initialize(mermaidConfig(compact));
 +        const host = document.getElementById('mermaidMeasure');
 +        host.textContent = '';
 +        const { svg } = await window.mermaid.render('rmMermaid' + (++renderSeq), source);
@@ -790,71 +849,131 @@
 +        return { width: c.width, height: c.height, gray };
 +    }
 +
-+    // locateText compares the screen before and after typing with the text
-+    // the plan expects, and returns how far the text landed from where it was
-+    // expected ({dx, dy, score}), or null when it was not found.
-+    function locateText(before, after, rows) {
-+        const W = after.width, H = after.height;
-+        if (before.width !== W || before.height !== H) return null;
-+        // Pixels that got darker: the new text (and the text cursor).
-+        const ink = new Uint8Array(W * H);
-+        for (let i = 0; i < ink.length; i++) ink[i] = before.gray[i] - after.gray[i] > 60 ? 1 : 0;
-+        // The expected text.
++    // stableScreen waits until the screen stops changing and returns it:
++    // xochitl lays typed text out more slowly than the keys arrive, and
++    // scrolls the page while it does.
++    async function stableScreen() {
++        let prev = await grabScreen();
++        for (let i = 0; i < 40; i++) {
++            await sleep(700);
++            const cur = await grabScreen();
++            let changed = 0;
++            for (let k = 0; k < cur.gray.length; k += 4) {
++                if (Math.abs(cur.gray[k] - prev.gray[k]) > 60) changed++;
++            }
++            if (changed < 100) return cur;
++            prev = cur;
++        }
++        return prev;
++    }
++
++    // textTemplate renders the text lines of a plan the way the tablet will
++    // show them: the pixels of every glyph, in plan coordinates, and the same
++    // on 8x8 cells for a coarse search.
++    function textTemplate(rows) {
 +        const c = document.createElement('canvas');
-+        c.width = W;
-+        c.height = H;
++        c.width = screenWidth;
++        c.height = 64;
 +        const ctx = c.getContext('2d', { willReadFrequently: true });
 +        ctx.font = `${TEXT.size}px "${TEXT.font}"`;
-+        for (const r of rows) ctx.fillText(r.text, TEXT.left, r.baseline);
-+        const alpha = ctx.getImageData(0, 0, W, H).data;
-+        const tpl = [];
-+        for (let i = 0; i < W * H; i++) if (alpha[4 * i + 3] > 128) tpl.push(i);
-+        if (!tpl.length) return { dx: 0, dy: 0, score: 1 };
++        const xs = [], ys = [], cells = new Set();
++        for (const r of rows) {
++            if (!r.text.trim()) continue;
++            ctx.clearRect(0, 0, c.width, c.height);
++            ctx.fillText(r.text, TEXT.left, 44);
++            const a = ctx.getImageData(0, 0, c.width, c.height).data;
++            for (let i = 3; i < a.length; i += 4) {
++                if (a[i] < 128) continue;
++                const x = (i >> 2) % c.width, y = Math.round(r.baseline) - 44 + ((i >> 2) / c.width | 0);
++                xs.push(x);
++                ys.push(y);
++                cells.add((y >> 3) * 4096 + (x >> 3));
++            }
++        }
++        const cx = [], cy = [];
++        for (const k of cells) {
++            cx.push(k % 4096);
++            cy.push(Math.floor(k / 4096));
++        }
++        return { xs, ys, cx, cy };
++    }
 +
-+        const score = (pts, grid, gw, gh, dx, dy) => {
-+            let hit = 0;
-+            for (const i of pts) {
-+                const x = i % gw + dx, y = ((i / gw) | 0) + dy;
-+                if (x >= 0 && y >= 0 && x < gw && y < gh && grid[y * gw + x]) hit++;
-+            }
-+            return hit / pts.length;
-+        };
-+        // Coarse search on 8x8 blocks: the text may land up to 160 px left or
-+        // right (another text width) and lower down (text already on the page).
-+        const S = 8, WS = Math.ceil(W / S), HS = Math.ceil(H / S);
-+        const inkS = new Uint8Array(WS * HS);
-+        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (ink[y * W + x]) inkS[((y / S) | 0) * WS + ((x / S) | 0)] = 1;
-+        const tplS = Array.from(new Set(tpl.map(i => ((((i / W) | 0) / S) | 0) * WS + (((i % W) / S) | 0))));
-+        let best = { dx: 0, dy: 0, score: -1 };
-+        for (let dy = -30; dy <= 225; dy++) {
-+            for (let dx = -20; dx <= 20; dx++) {
-+                const s = score(tplS, inkS, WS, HS, dx, dy);
-+                if (s > best.score || (s === best.score && Math.abs(dy) + Math.abs(dx) < Math.abs(best.dy) + Math.abs(best.dx))) {
-+                    best = { dx, dy, score: s };
++    // inkMasks returns the dark pixels of a screenshot without the lone dots
++    // of a grid or dotted page template (text and strokes have neighbours),
++    // grown by two pixels to forgive antialiasing, and the same on 8x8 cells.
++    function inkMasks(shot) {
++        const W = shot.width, H = shot.height, g = shot.gray;
++        let ink = new Uint8Array(W * H);
++        for (let y = 1; y < H - 1; y++) {
++            for (let x = 1; x < W - 1; x++) {
++                const i = y * W + x;
++                if (g[i] >= 100) continue;
++                if (g[i - 1] < 100 || g[i + 1] < 100 || g[i - W] < 100 || g[i + W] < 100 ||
++                    g[i - W - 1] < 100 || g[i - W + 1] < 100 || g[i + W - 1] < 100 || g[i + W + 1] < 100) {
++                    ink[i] = 1;
 +                }
 +            }
 +        }
-+        // Fine search around it, with the ink grown by two pixels to forgive
-+        // differences in antialiasing and rounding.
-+        let grown = ink;
++        const WS = Math.ceil(W / 8), HS = Math.ceil(H / 8);
++        const cells = new Uint8Array(WS * HS);
++        for (let i = 0; i < ink.length; i++) if (ink[i]) cells[((i / W | 0) >> 3) * WS + ((i % W) >> 3)] = 1;
 +        for (let pass = 0; pass < 2; pass++) {
-+            const g = new Uint8Array(W * H);
-+            for (let y = 1; y < H - 1; y++) {
-+                for (let x = 1; x < W - 1; x++) {
-+                    const i = y * W + x;
-+                    g[i] = grown[i] | grown[i - 1] | grown[i + 1] | grown[i - W] | grown[i + W];
++            const grown = new Uint8Array(W * H);
++            for (let i = W; i < ink.length - W; i++) {
++                grown[i] = ink[i] | ink[i - 1] | ink[i + 1] | ink[i - W] | ink[i + W];
++            }
++            ink = grown;
++        }
++        return { W, H, ink, WS, HS, cells };
++    }
++
++    // findText looks for the typed text on a screenshot and returns where it
++    // could be relative to the plan: matches {dx, dy, score}, best first,
++    // searching offsets in the ranges dx and dy ([min, max], px). There can
++    // be more than one: the same diagram drawn twice on a page, or labels
++    // that repeat (a sequence diagram matches itself a few lines off).
++    function findText(shot, tpl, dx, dy) {
++        const m = inkMasks(shot);
++        const score = (xs, ys, grid, gw, gh, ox, oy) => {
++            let hit = 0, seen = 0;
++            for (let k = 0; k < xs.length; k++) {
++                const x = xs[k] + ox, y = ys[k] + oy;
++                if (x < 0 || y < 0 || x >= gw || y >= gh) continue;
++                seen++;
++                hit += grid[y * gw + x];
++            }
++            return { hit, seen };
++        };
++        // Good offsets explain the most text on the screen: hits minus
++        // misses, rather than a ratio, which a sliver of text at the edge of
++        // the screen could top. A few of the best coarse ones are refined.
++        const coarse = [];
++        for (let oy = Math.floor(dy[0] / 8); oy <= Math.ceil(dy[1] / 8); oy++) {
++            for (let ox = Math.floor(dx[0] / 8); ox <= Math.ceil(dx[1] / 8); ox++) {
++                const r = score(tpl.cx, tpl.cy, m.cells, m.WS, m.HS, ox, oy);
++                coarse.push({ ox, oy, v: 2 * r.hit - r.seen });
++            }
++        }
++        coarse.sort((a, b) => b.v - a.v);
++        const picked = [];
++        for (const c of coarse) {
++            if (picked.length === 6) break;
++            if (c.v > 0 && picked.every(o => Math.abs(o.oy - c.oy) > 4)) picked.push(c);
++        }
++        const found = [];
++        for (const c of picked) {
++            let fine = null;
++            for (let oy = c.oy * 8 - 10; oy <= c.oy * 8 + 10; oy++) {
++                for (let ox = c.ox * 8 - 10; ox <= c.ox * 8 + 10; ox++) {
++                    const r = score(tpl.xs, tpl.ys, m.ink, m.W, m.H, ox, oy);
++                    const v = 2 * r.hit - r.seen;
++                    if (!fine || v > fine.v) fine = { dx: ox, dy: oy, v, score: r.seen ? r.hit / r.seen : 0, seen: r.seen };
 +                }
 +            }
-+            grown = g;
++            if (fine.seen >= Math.min(tpl.xs.length, 300)) found.push(fine);
 +        }
-+        let fine = { dx: 0, dy: 0, score: -1 };
-+        for (let dy = best.dy * S - S - 2; dy <= best.dy * S + S + 2; dy++) {
-+            for (let dx = best.dx * S - S - 2; dx <= best.dx * S + S + 2; dx++) {
-+                const s = score(tpl, grown, W, H, dx, dy);
-+                if (s > fine.score) fine = { dx, dy, score: s };
-+            }
-+        }
-+        return fine.score >= 0.6 ? fine : null;
++        const top = Math.max(0, ...found.map(f => f.score));
++        return found.filter(f => f.score >= 0.75 && f.score >= top - 0.1).sort((a, b) => b.score - a.score);
 +    }
 +
 +    // ---------------------------------------------------------------------
@@ -882,13 +1001,29 @@
 +                buf = buf.slice(nl + 1);
 +                if (msg.error) throw new Error(msg.error);
 +                if (msg.ok) return;
-+                onProgress(msg);
++                if (msg.phase === 'waiting') {
++                    setStatus('Waiting for the tablet to catch up…');
++                } else {
++                    onProgress(msg);
++                }
 +            }
 +        }
 +    }
 +
 +    const sleep = ms => new Promise(r => setTimeout(r, ms));
 +
++    // toPen converts strokes on the screen to the proxy's normalised pen
++    // coordinates.
++    const toPen = strokes => strokes.map(line => line.flatMap(p => [
++        +((p.x - PEN_MAP.ox) / PEN_MAP.sx / screenWidth).toFixed(5),
++        +((p.y - PEN_MAP.oy) / PEN_MAP.sy / screenHeight).toFixed(5)
++    ]));
++
++    // drawOnTablet types the labels, then draws the strokes where the text
++    // landed. A diagram taller than the screen is drawn in parts from the
++    // bottom up: xochitl scrolls to the end of the text while typing, and
++    // moving the text cursor up scrolls it back, part by part. After every
++    // move a screenshot tells where the page is.
 +    async function drawOnTablet() {
 +        if (!plan || job) return;
 +        if (typeof deviceOrientation === 'string' && deviceOrientation !== 'Portrait') {
@@ -900,30 +1035,11 @@
 +        const signal = job.signal;
 +        updateButtons();
 +        try {
-+            let { strokes } = plan;
-+            if (plan.text) {
-+                setStatus('Taking a screenshot…');
-+                const before = await grabScreen();
-+                await runJob({ text: plan.text }, p => setStatus(`Typing the labels… ${p.done}/${p.total} keys`), signal);
-+                await sleep(1500);
-+                setStatus('Looking for the labels on the screen…');
-+                const after = await grabScreen();
-+                const found = locateText(before, after, plan.rows);
-+                if (!found) {
-+                    throw new Error('The typed labels were not found on the screen, so nothing was drawn. ' +
-+                        'Use an empty page in portrait, not zoomed, with the default text width. Undo the text on the tablet and try again.');
-+                }
-+                strokes = strokes.map(line => line.map(p => ({ x: p.x + found.dx, y: p.y + found.dy })));
-+                const [, bottom] = extent(strokes, p => p.y);
-+                if (bottom > screenHeight - PAGE_MARGIN.bottom) {
-+                    throw new Error('The labels landed too low on the page for the diagram to fit, so nothing was drawn. Use an empty page.');
-+                }
++            if (!plan.text) {
++                await runJob({ strokes: toPen(plan.strokes) }, p => setStatus(`Drawing… ${Math.round(100 * p.done / p.total)}%`), signal);
++            } else {
++                await drawInParts(plan, signal);
 +            }
-+            const norm = strokes.map(line => line.flatMap(p => [
-+                +((p.x - PEN_MAP.ox) / PEN_MAP.sx / screenWidth).toFixed(5),
-+                +((p.y - PEN_MAP.oy) / PEN_MAP.sy / screenHeight).toFixed(5)
-+            ]));
-+            await runJob({ strokes: norm }, p => setStatus(`Drawing… ${Math.round(100 * p.done / p.total)}%`), signal);
 +            setStatus('Done.');
 +            showMessage('Diagram drawn on the tablet', MessageDuration.QUICK);
 +        } catch (e) {
@@ -931,6 +1047,70 @@
 +        } finally {
 +            job = null;
 +            updateButtons();
++        }
++    }
++
++    async function drawInParts(p, signal) {
++        const H = screenHeight;
++        const tpl = textTemplate(p.rows);
++
++        // look finds the text on the screen, its offset searched in the
++        // ranges dx and dy, and picks one of the matches.
++        const look = async (dx, dy, pick) => {
++            setStatus('Looking for the labels on the screen…');
++            await sleep(500);
++            const found = findText(await stableScreen(), tpl, dx, dy);
++            const choice = found.length ? pick(found) : null;
++            if (!choice) {
++                throw new Error('The typed labels were not found on the screen, so the rest was not drawn. ' +
++                    'Use a page in portrait, not zoomed, with the default text width, and do not touch it while it draws. Undo on the tablet and try again.');
++            }
++            return choice;
++        };
++
++        await runJob({ text: p.text }, q => setStatus(`Typing the labels… ${q.done}/${q.total} keys`), signal);
++        // Typing leaves the cursor, and the screen, at the last line.
++        const lastY = p.rows[p.rows.length - 1].baseline;
++        // The text just typed is the last on the page: of matches that are
++        // as good (the same diagram drawn before), take the lowest.
++        let view = await look([-160, 160], [-lastY, H - lastY],
++            found => found.filter(f => f.score >= found[0].score - 0.03).sort((a, b) => b.dy - a.dy)[0]);
++        if (p.bottom + view.dy > H - PAGE_MARGIN.bottom) {
++            throw new Error('The bottom of the diagram is below the screen, so nothing was drawn. Undo the text on the tablet and try again on an empty page.');
++        }
++        let drawn = Infinity; // everything below this (plan y) is drawn
++        for (let part = 1; ; part++) {
++            const from = PAGE_MARGIN.top - view.dy;
++            const to = Math.min(H - PAGE_MARGIN.bottom - view.dy, drawn);
++            // Pieces cut at the edges of a part overlap the next part a little.
++            const pieces = p.strokes
++                .flatMap(line => clip(line, { x0: -1e9, x1: 1e9, y0: from - CORNER_OVERLAP, y1: to + CORNER_OVERLAP }))
++                .filter(line => length(line) >= 1)
++                .map(line => line.map(q => ({ x: q.x + view.dx, y: q.y + view.dy })));
++            if (pieces.length) {
++                const label = p.tall ? `Drawing part ${part}…` : 'Drawing…';
++                await runJob({ strokes: toPen(pieces) }, q => setStatus(`${label} ${Math.round(100 * q.done / q.total)}%`), signal);
++            }
++            drawn = Math.min(drawn, from);
++            if (drawn <= p.top) return;
++
++            // The next part: Page Up scrolls 80 % of the screen, so the
++            // parts overlap; near the top of the page it scrolls less.
++            setStatus(`Scrolling to part ${part + 1}…`);
++            await runJob({ pagesUp: 1 }, () => {}, signal);
++            // Page Up moves the page by PAGE_STEP, less only at the top of
++            // the page, where the first labels, which do not repeat, are on
++            // the screen and the best match is right.
++            const expected = view.dy + PAGE_STEP * H;
++            const next = await look([view.dx - 16, view.dx + 16], [view.dy - 50, expected + 100],
++                found => found.find(f => Math.abs(f.dy - expected) <= 40) || found[0]);
++            if (next.dy <= view.dy + 20) {
++                throw new Error('The page did not scroll up, so the top of the diagram was not drawn.');
++            }
++            if (H - PAGE_MARGIN.bottom - next.dy < drawn - 10) {
++                throw new Error('The page scrolled too far, so the rest of the diagram was not drawn.');
++            }
++            view = next;
 +        }
 +    }
 +
@@ -1023,11 +1203,12 @@
 +        const box = dialog().querySelector('.mermaid-preview');
 +        box.textContent = '';
 +        if (!p) return;
++        const height = Math.max(screenHeight, p.bottom + PAGE_MARGIN.bottom);
 +        const svg = document.createElementNS(SVG_NS, 'svg');
-+        svg.setAttribute('viewBox', `0 0 ${screenWidth} ${screenHeight}`);
++        svg.setAttribute('viewBox', `0 0 ${screenWidth} ${height}`);
 +        const page = document.createElementNS(SVG_NS, 'rect');
 +        page.setAttribute('width', screenWidth);
-+        page.setAttribute('height', screenHeight);
++        page.setAttribute('height', height);
 +        page.setAttribute('class', 'mermaid-page');
 +        svg.appendChild(page);
 +        for (const line of p.strokes) {
@@ -1062,7 +1243,7 @@
 +            plan = p;
 +            showPreview(p);
 +            showWarnings(p.warnings);
-+            setStatus('');
++            setStatus(p.tall ? 'Taller than the screen: the tablet scrolls while it draws, part by part.' : '');
 +        } catch (e) {
 +            if (seq !== refreshSeq) return;
 +            plan = null;

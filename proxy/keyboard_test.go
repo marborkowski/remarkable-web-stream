@@ -63,3 +63,16 @@ func TestTypeableChars(t *testing.T) {
 		t.Errorf("typeableChars cannot be typed: %v", err)
 	}
 }
+
+func TestIsDead(t *testing.T) {
+	for _, k := range []keyStroke{deadAcute, deadGrave, deadDiaeresis, deadTilde, deadCircumflex} {
+		if !k.isDead() {
+			t.Errorf("%v is a dead key", k)
+		}
+	}
+	for _, r := range "a6^7[" {
+		if k, ok := usKeys[r]; ok && k.isDead() {
+			t.Errorf("%q (%v) is not a dead key", r, k)
+		}
+	}
+}
