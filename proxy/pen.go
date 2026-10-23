@@ -46,6 +46,7 @@ type penWriter struct {
 	maxX, maxY     int32
 	pressure       int32
 	owner          any // session currently holding the pen (nil = free)
+	reserved       any // drawing job keeping the pen between its strokes (nil = none)
 	inRange, touch bool
 	lastEvent      time.Time
 }
@@ -126,7 +127,7 @@ func clamp01(v float64) float64 {
 func (p *penWriter) apply(owner any, cmd byte, x, y float64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.owner != nil && p.owner != owner {
+	if (p.owner != nil && p.owner != owner) || (p.reserved != nil && p.reserved != owner) {
 		return false
 	}
 	if err := p.openLocked(); err != nil {
@@ -153,6 +154,22 @@ func (p *penWriter) apply(owner any, cmd byte, x, y float64) bool {
 		p.emitLocked(evKey, btnTouch, 1)
 		p.emitLocked(evSyn, 0, 0)
 		p.touch = true
+	case 'h':
+		// Hover: in range above the screen, not touching. Drawing jobs move
+		// the pen like this before touching down, as a hand does; xochitl
+		// smooths strokes with some inertia and needs the approach.
+		if p.touch {
+			return true
+		}
+		p.owner = owner
+		if !p.inRange {
+			p.emitLocked(evKey, btnToolPen, 1)
+			p.inRange = true
+		}
+		p.emitLocked(evAbs, absX, ax)
+		p.emitLocked(evAbs, absY, ay)
+		p.emitLocked(evAbs, absDistance, 10)
+		p.emitLocked(evSyn, 0, 0)
 	case 'm':
 		if !p.touch {
 			return true // ignore moves while the pen is up (no hover)
@@ -195,6 +212,22 @@ func (p *penWriter) release(owner any) {
 	if p.owner == owner {
 		p.liftLocked()
 	}
+	if p.reserved == owner {
+		p.reserved = nil
+	}
+}
+
+// reserve keeps the pen for owner until release(owner), so that nobody else
+// can draw between the strokes of a drawing job. It fails while someone
+// else holds or reserved the pen.
+func (p *penWriter) reserve(owner any) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if (p.owner != nil && p.owner != owner) || (p.reserved != nil && p.reserved != owner) {
+		return false
+	}
+	p.reserved = owner
+	return true
 }
 
 func (p *penWriter) watchdog() {

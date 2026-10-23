@@ -38,6 +38,7 @@ Open a URL on any computer or phone, sign in with the password, and see what you
 - **Password and invite links.** A small Go reverse proxy (`rmshare`) handles the login form, session cookies and brute-force throttling. You sign in with the password. Other people get **invite links** that expire or can be revoked, and that only let them watch, not draw.
 - **Reachable from anywhere.** You can use [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) (a stable URL, free, no domain needed), a Cloudflare quick tunnel (no account at all), or a Cloudflare named tunnel (your own domain).
 - **Draw from the browser.** You can draw on the tablet with a mouse, finger or stylus. Strokes are injected as real pen events, so they use the tool currently selected on the tablet.
+- **Mermaid diagrams.** Paste a [Mermaid](https://mermaid.js.org) diagram and the tablet redraws it: the labels are typed with xochitl's own text tool, so they are real text, and the boxes and arrows are drawn with the pen.
 - **Auto-rotate.** The preview follows the tablet's orientation within a fraction of a second.
 - **Sleep-aware.** When the tablet's display goes to sleep, streams are cut off and the page shows "The tablet is asleep". It recovers by itself on wake-up.
 - **"Someone is watching" signal.** The front light blinks twice when a viewer connects and once, longer, when the last viewer leaves.
@@ -64,7 +65,7 @@ browser ──HTTPS──▶ tunnel (Tailscale Funnel / Cloudflare) ──▶ tu
 | Service | Binary | Role |
 | --- | --- | --- |
 | `rmshare-stream` | `gomarkablestream` | Upstream [goMarkableStream](https://github.com/owulveryck/goMarkableStream) built from source with [our patches](gms/). Bound to `127.0.0.1` only, with its own authentication disabled, so it can be reached only through the proxy. |
-| `rmshare-proxy` | `rmshare` ([`proxy/`](proxy/)) | Login (password or invite link) and reverse proxy on `:8080`, plus all the extras: sleep and orientation detection from the xochitl journal, the remote pen WebSocket, the front-light signal and the URL document. |
+| `rmshare-proxy` | `rmshare` ([`proxy/`](proxy/)) | Login (password or invite link) and reverse proxy on `:8080`, plus all the extras: sleep and orientation detection from the xochitl journal, the remote pen WebSocket, the drawing jobs of the Mermaid import, the front-light signal and the URL document. |
 | `rmshare-tunnel` | `cloudflared` or `tailscaled` | Publishes the proxy to the internet ([`device/run-tunnel.sh`](device/run-tunnel.sh)). |
 
 For the details of each feature and of each patch, see [docs/how-it-works.md](docs/how-it-works.md).
@@ -134,6 +135,7 @@ The viewer is goMarkableStream's web UI with a few additions in the left-hand me
 | --- | --- | --- |
 | **Auto-rotate** | `A` | Follow the tablet's orientation (on by default; the choice is remembered). A manual **Rotate** (`R`) turns auto-rotate off. |
 | **Draw** | `D` | Turn the preview into a drawing surface. Strokes go to the tablet with a fixed 50% pressure and the tool currently selected on the tablet (pen, marker, eraser, …). Only one person can draw at a time. Guests do not get this button. |
+| **Mermaid** | | Draw a [Mermaid diagram](#drawing-mermaid-diagrams) on the tablet. Shown only to the owner. |
 | **Invite** | | Open the [invitations page](#inviting-viewers) (`/invites`). Shown only to the owner. |
 
 Other behaviour to know about:
@@ -141,13 +143,27 @@ Other behaviour to know about:
 - **Viewer signal.** The front light blinks **twice** about 2 s after the first viewer connects. It blinks **once, longer** about 15 s after the last viewer leaves. With a bright light the blink dims it; with a dim or off light the blink brightens it. Your brightness is always restored.
 - **Log out** by visiting `/logout`, or from the *Who is signed in* list on `/invites`.
 
+### Drawing Mermaid diagrams
+
+1. On the tablet, open a page in **portrait**, not zoomed, and pick the **fineliner** (other tools work, but the fineliner gives the cleanest lines). An empty page is best; on a page with text, the diagram goes below it.
+2. In the viewer, press **Mermaid**, then paste or write the diagram. The preview on the right shows the page as it will look: the blue text is what will be typed.
+3. Press **Draw on the tablet** and leave the tablet alone until the dialog says *Done*. That takes about half a minute for a small diagram and a few minutes for one several screens tall.
+
+The labels are typed as **real text**, through a virtual keyboard that the proxy plugs in for the duration of the job. xochitl's text is one flowing document per page, so labels cannot go just anywhere: they go on its lines, moved right with spaces, and the diagram is stretched vertically so that every label sits on a line. After typing, the viewer finds the text on a screenshot and draws the boxes and arrows around it with the pen. A diagram taller than the screen is drawn in parts from the bottom up: the tablet scrolls the page with Page Up between them. Details are in [docs/how-it-works.md](docs/how-it-works.md#mermaid-diagrams).
+
+Limitations:
+- **Size.** The text uses the tablet's body size (32 px), so a diagram is drawn at the size Mermaid would draw it with that font. Its height is not limited: a tall diagram is drawn in parts, scrolling in between. Its width is: the labels must fit one line of text (about 1140 px). A diagram that is too wide is laid out more compactly, and a left-to-right flowchart is turned top to bottom; if it still does not fit, the dialog says so before anything is drawn. A tall diagram also needs labels on every screen (the viewer finds the page by them).
+- **Characters.** The virtual keyboard has the tablet's US layout: `[ ] { }` become `( )`, and letters without a dead key on that layout lose their accent (`ą ę ł ż` → `a e l z`; `ć ń ó ś ź é ä ü` and similar stay).
+- **Diagram types.** Flowcharts, sequence, class, state and ER diagrams work well. Rotated labels and parts that Mermaid renders as HTML are left out, and labels that Mermaid draws in another font size may not fit their boxes; the dialog warns about all of these.
+- **The drawing follows the text.** xochitl anchors strokes to the text near them, so if you later type above the diagram or edit its labels, the lines move with the text and may no longer match. The typed text is one paragraph you can undo or delete like any other.
+
 ### Inviting viewers
 
 You do not need to share the password. Open **`/invites`** (the **Invite** button in the menu) and create a link:
 
 - Give it a label (who it is for) and a lifetime from 1 hour to 30 days.
 - The link (`https://…/join/<random token>`) is shown **once**, with a QR code. Anyone who opens it and presses *Join* can watch until the link expires or you revoke it.
-- Guests can only **watch**. The *Draw* button is hidden for them and the pen endpoint refuses them.
+- Guests can only **watch**. The *Draw* and *Mermaid* buttons are hidden for them, and the pen and drawing endpoints refuse them.
 - The same page lists everyone who is signed in, with the IP address and the last activity, and lets you end any session. Revoking a link ends all sessions opened through it.
 - Links and sessions survive a proxy restart and a reboot. They are stored in `/home/root/rmshare/state.json`.
 
@@ -178,7 +194,9 @@ The proxy itself has command-line flags. Change them in [`device/rmshare-proxy.s
 | `-doc` | `false` | Publish the URL document (the unit passes `${PUBLISH_DOC}`). |
 | `-xochitl-dir` | `/home/root/.local/share/remarkable/xochitl` | xochitl document directory. |
 | `-sleep-watch` | `true` | Follow sleep and orientation in the xochitl journal. |
-| `-pen-device` | `/dev/input/event2` | Pen input device for remote drawing (`""` disables it). |
+| `-pen-device` | `/dev/input/event2` | Pen input device for remote drawing (`""` disables it, and the Mermaid import with it). |
+| `-keyboard-device` | `/dev/uinput` | uinput device for the virtual keyboard of the Mermaid import (`""` disables typing). |
+| `-xochitl-bin` | `/usr/bin/xochitl` | xochitl binary; the font of typed text is read from it for the Mermaid import. |
 | `-notify-light` | `/sys/class/backlight/rm_frontlight` | Front light for the viewer signal (`""` disables it). |
 
 The component versions are pinned in [`deploy.sh`](deploy.sh). You can override them with environment variables: `GMS_VERSION` (goMarkableStream, default `v1.4.0`), `CF_VERSION` (cloudflared) and `TS_VERSION` (Tailscale). The patches target goMarkableStream `v1.4.0`, so other versions may need patch updates.
@@ -240,9 +258,9 @@ This project puts a live view of your tablet on the internet. Please understand 
 - **The local listener uses plain HTTP.** The proxy listens on `:8080` on every interface of the tablet (USB and Wi-Fi) without TLS. On a shared or untrusted Wi-Fi network, someone else on that network can intercept the password and session cookie. Only the tunnels provide HTTPS.
 - **Everything runs as `root`.** This includes the proxy, goMarkableStream, cloudflared and tailscaled. The proxy needs root to read xochitl's memory, inject pen events, control the front light and restart xochitl. A bug in any of these components could therefore compromise the whole device.
 - **goMarkableStream runs with its own authentication disabled** (`-unsafe`, `RK_JWT_ENABLED=false`). It is bound to `127.0.0.1`, so only processes on the tablet can reach it directly.
-- **The proxy changes your tablet.** With `PUBLISH_DOC=1`, it writes a document into your xochitl library and **restarts xochitl**, which could interrupt whatever you are doing. Remote drawing writes real strokes into the open document.
+- **The proxy changes your tablet.** With `PUBLISH_DOC=1`, it writes a document into your xochitl library and **restarts xochitl**, which could interrupt whatever you are doing. Remote drawing writes real strokes into the open document. The Mermaid import also plugs in a **virtual keyboard** and types into the open page; keyboard shortcuts are not used beyond moving to the end of the text and choosing the paragraph style.
 - **Secrets are stored in plain text** in `/home/root/rmshare/tunnel.env` on the device (mode `600`). That includes the password, Tailscale auth keys and Cloudflare tokens. They are also on your computer in `tunnel.env`, which is git-ignored. Never commit it.
-- **Downloads are not checksum-verified.** `deploy.sh` downloads cloudflared, Tailscale and the goMarkableStream source over HTTPS from their official locations, but it does not verify signatures or checksums.
+- **Most downloads are not checksum-verified.** `deploy.sh` downloads cloudflared, Tailscale and the goMarkableStream source over HTTPS from their official locations, but it does not verify signatures or checksums. Only the Mermaid library, which runs in the viewer page, is checked against the SHA-256 sums pinned in [`gms/build-gms.sh`](gms/build-gms.sh).
 - **Client IPs in the logs can be spoofed.** They come from `CF-Connecting-IP` / `X-Forwarded-For` and are used only for logging.
 - **The system partition is modified.** To start on boot, `install.sh` remounts the read-only root partition read-write and adds three systemd unit files to it (nothing else is changed). `uninstall.sh` removes them.
 - **Developer mode** and root SSH access lower the tablet's own security. That is a prerequisite of this project, not something it adds.
@@ -258,6 +276,8 @@ proxy/                    rmshare, the password-protected proxy (Go)
   pages.go, pages.html      login, join and invitation pages
   sleep.go                  xochitl journal watcher: sleep state, orientation, /state long-poll
   pen.go                    remote pen: /pen WebSocket -> evdev events
+  keyboard.go               virtual keyboard (uinput) that types with xochitl's text tool
+  draw.go                   drawing jobs for the Mermaid import: typing, paced strokes, text font
   viewers.go                viewer counting and front-light signal
   urldoc.go                 /url page and PDF with URL + QR code for the tablet library
 gms/                      goMarkableStream build script and patches
@@ -290,6 +310,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, including how to update t
 ## Credits
 
 - [goMarkableStream](https://github.com/owulveryck/goMarkableStream) by Olivier Wulveryck (MIT) does all the heavy lifting of reading and streaming the screen. This project only patches it and wraps it.
+- [Mermaid](https://github.com/mermaid-js/mermaid) (MIT) renders the diagrams of the Mermaid import, in the browser.
 - [cloudflared](https://github.com/cloudflare/cloudflared), [Tailscale](https://tailscale.com) and [go-qrcode](https://github.com/skip2/go-qrcode).
 
 *reMarkable is a trademark of reMarkable AS. This project is not affiliated with, endorsed by or supported by reMarkable AS. Using developer mode and third-party software on your tablet may affect your warranty and support options.*

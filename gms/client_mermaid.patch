@@ -1,0 +1,1421 @@
+--- a/client/index.html
++++ b/client/index.html
+@@ -58,6 +58,15 @@
+ 							<div class="button-tooltip">Draw on the tablet <kbd>D</kbd></div>
+ 						</button>
+ 					</li>
++					<li id="mermaidMenuItem">
++						<button id="mermaidButton" class="apple-button" aria-label="Draw a Mermaid diagram on the tablet">
++							<svg class="button-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
++								<path fill="currentColor" d="M9,2V8H11V11H5C3.89,11 3,11.89 3,13V16H1V22H7V16H5V13H11V16H9V22H15V16H13V13H19V16H17V22H23V16H21V13C21,11.89 20.11,11 19,11H13V8H15V2H9Z"/>
++							</svg>
++							<span>Mermaid</span>
++							<div class="button-tooltip">Draw a Mermaid diagram on the tablet</div>
++						</button>
++					</li>
+ 					<li id="inviteMenuItem" style="display: none;">
+ 						<button id="inviteButton" class="apple-button" aria-label="Invite viewers: create and revoke invite links">
+ 							<svg class="button-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+@@ -309,5 +318,6 @@ Currently: <span id="layerOrderStatus">Drawing on Top</span></div>
+ 		<script src="canvasHandling.js"></script>
+ 		<script src="uiInteractions.js"></script>
+ 		<script src="workersHandling.js"></script>
++		<script src="mermaid.js"></script>
+ 	</body>
+ </html>
+\ No newline at end of file
+--- /dev/null
++++ b/client/mermaid.js
+@@ -0,0 +1,1246 @@
++// ---------------------------------------------------------------------------
++// Mermaid import: redraw a Mermaid diagram on the tablet.
++//
++// The diagram is rendered here by Mermaid in the font and size xochitl uses
++// for typed text (reMarkable Sans, 32 px), so its boxes fit the labels as the
++// tablet will show them. The labels are typed with xochitl's own text tool
++// through the proxy's virtual keyboard; boxes, lines and arrows are drawn
++// with the remote pen.
++//
++// xochitl's text is one flowing document per page, so labels cannot be put
++// anywhere: they go on the lines of one paragraph (Shift+Enter, 45.7 px
++// apart), moved right with spaces. The diagram is stretched vertically so
++// that every label sits on a line, and its strokes follow.
++//
++// A drawing job: type the text (POST /draw), find it on a screenshot, then
++// draw the strokes where the text actually landed (POST /draw). A diagram
++// taller than the screen is drawn in parts from the bottom up, scrolling the
++// page with Page Up in between.
++// ---------------------------------------------------------------------------
++(function () {
++    'use strict';
++
++    // Typed text on the reMarkable Paper Pro (portrait, page not zoomed),
++    // measured on screenshots, in screen pixels.
++    const TEXT = {
++        font: 'rmTextFont',
++        size: 32,            // Body style
++        linePitch: 45.67,    // between the lines of a paragraph (Shift+Enter)
++        left: 242,           // start of the text column
++        columnWidth: 1140,   // a line longer than this wraps
++        firstBaseline: 367.5 // first Body line of a page (under the empty Title line)
++    };
++    // Strokes stay clear of the toolbar, the close button at the top and the
++    // paragraph menu xochitl shows left of the text, where a pen touch is a
++    // tap on a button.
++    const PAGE_MARGIN = { left: 210, top: 120, right: 20, bottom: 30 };
++    // xochitl maps the pen onto the 1620x2160 panel of the Paper Pro, while
++    // its framebuffer is 1632x2154: screen x = 1620/1632 * pen x + 3.2,
++    // screen y = 2160/2154 * pen y - 0.7 (measured).
++    const PEN_MAP = screenWidth === 1632 && screenHeight === 2154
++        ? { sx: 1620 / 1632, ox: 3.2, sy: 2160 / 2154, oy: -0.7 }
++        : { sx: 1, ox: 0, sy: 1, oy: 0 };
++    const PAGE_STEP = 0.804;   // of the screen: how far Page Up scrolls (measured)
++    const ROW_TOLERANCE = 12;  // px: labels this close vertically share a text line
++    const SAMPLE_STEP = 2;     // px between samples of an outline
++    // px between pen samples. The proxy sends one every 4 ms, so this sets the
++    // pen speed: about 8 cm/s, a normal writing speed.
++    const PEN_STEP = 3;
++    const CORNER_OVERLAP = 1.5; // px: strokes meeting at a corner overlap this much
++    // Mermaid sizes arrowheads for 16 px text; the tablet's text is twice that.
++    const MARKER_SCALE = 1.75;
++    const MERMAID_SRC = 'lib/mermaid.min.js';
++    const STORAGE_KEY = 'rmshare.mermaid.source';
++    const EXAMPLE = [
++        'flowchart TD',
++        '    A[Idea] --> B{Worth it?}',
++        '    B -- yes --> C[Build it]',
++        '    B -- no --> D[Drop it]',
++        '    C --> E[Show it]'
++    ].join('\n');
++
++    let loading = null;   // Promise: Mermaid, the text font and /draw/info
++    let typeable = null;  // Set of characters the virtual keyboard can type
++    let plan = null;      // layout of the current source, or null
++    let job = null;       // AbortController of the running drawing job
++    let renderSeq = 0;    // unique ids for Mermaid renders
++    let refreshSeq = 0;   // the latest refresh of the preview wins
++    let measureCtx = null;
++
++    // ---------------------------------------------------------------------
++    // Loading
++    // ---------------------------------------------------------------------
++
++    function loadScript(src) {
++        return new Promise((resolve, reject) => {
++            const s = document.createElement('script');
++            s.src = src;
++            s.onload = resolve;
++            s.onerror = () => reject(new Error('cannot load ' + src));
++            document.head.appendChild(s);
++        });
++    }
++
++    function load() {
++        if (!loading) {
++            loading = (async () => {
++                const info = await fetch('/draw/info', { cache: 'no-store' });
++                if (!info.ok) {
++                    throw new Error(info.status === 404 ? 'drawing jobs are not available on this tablet' : 'HTTP ' + info.status);
++                }
++                const data = await info.json();
++                if (!data.keyboard) {
++                    throw new Error('typing is disabled on the tablet (-keyboard-device)');
++                }
++                typeable = new Set(Array.from(data.chars));
++                const font = new FontFace(TEXT.font, 'url(/draw/font)');
++                await font.load();
++                document.fonts.add(font);
++                if (!window.mermaid) {
++                    await loadScript(MERMAID_SRC);
++                }
++            })();
++            loading.catch(() => { loading = null; });
++        }
++        return loading;
++    }
++
++    // Layouts tried in turn until the labels fit a line of the tablet's text:
++    // Mermaid's own spacing, then tighter spacing and narrower labels. The
++    // wrapping widths are for text twice Mermaid's default size.
++    const COMPACT = [
++        { spacing: 1, wrap: 360, actor: 150 },
++        { spacing: 0.6, wrap: 260, actor: 110 },
++        { spacing: 0.35, wrap: 180, actor: 80 }
++    ];
++
++    function mermaidConfig(c) {
++        const f = TEXT.font;
++        const gap = v => Math.round(v * c.spacing);
++        return {
++            startOnLoad: false,
++            securityLevel: 'strict',
++            suppressErrorRendering: true,
++            theme: 'base',
++            htmlLabels: false,
++            fontFamily: f,
++            fontSize: TEXT.size, // some diagram types take their font size from here
++            themeVariables: {
++                fontFamily: f,
++                fontSize: TEXT.size + 'px',
++                background: '#ffffff',
++                primaryColor: '#ffffff',
++                primaryTextColor: '#000000',
++                primaryBorderColor: '#000000',
++                secondaryColor: '#ffffff',
++                tertiaryColor: '#ffffff',
++                lineColor: '#000000',
++                textColor: '#000000',
++                clusterBkg: '#ffffff',
++                clusterBorder: '#000000',
++                edgeLabelBackground: '#ffffff'
++            },
++            flowchart: {
++                htmlLabels: false, useMaxWidth: false, wrappingWidth: c.wrap,
++                nodeSpacing: gap(50), rankSpacing: gap(50)
++            },
++            sequence: {
++                useMaxWidth: false,
++                actorMargin: gap(50), width: c.actor, boxMargin: gap(10),
++                actorFontFamily: f, actorFontSize: TEXT.size,
++                noteFontFamily: f, noteFontSize: TEXT.size,
++                messageFontFamily: f, messageFontSize: TEXT.size
++            },
++            class: { htmlLabels: false, useMaxWidth: false, nodeSpacing: gap(50), rankSpacing: gap(50) },
++            state: { useMaxWidth: false, nodeSpacing: gap(50), rankSpacing: gap(50) },
++            er: { useMaxWidth: false, fontSize: TEXT.size, nodeSpacing: gap(140), rankSpacing: gap(80) }
++        };
++    }
++
++    function measure(s) {
++        if (!measureCtx) {
++            measureCtx = document.createElement('canvas').getContext('2d');
++        }
++        measureCtx.font = `${TEXT.size}px "${TEXT.font}"`;
++        return measureCtx.measureText(s).width;
++    }
++
++    // ---------------------------------------------------------------------
++    // Text the tablet can type
++    // ---------------------------------------------------------------------
++
++    const REPLACEMENTS = {
++        '[': '(', ']': ')', '{': '(', '}': ')',
++        'ł': 'l', 'Ł': 'L', 'ß': 'ss', 'æ': 'ae', 'Æ': 'AE', 'ø': 'o', 'Ø': 'O', 'đ': 'd', 'Đ': 'D',
++        '‘': "'", '’': "'", '‚': ',', '“': '"', '”': '"', '„': '"', '«': '"', '»': '"',
++        '–': '-', '—': '-', '−': '-', '…': '...', '•': '*', '·': '*', '×': 'x', '→': '->', '←': '<-',
++        '\u00a0': ' ', '\t': ' '
++    };
++
++    // sanitize returns s with every character the tablet keyboard cannot type
++    // replaced: with a close ASCII character, the letter without its accent
++    // (ą -> a), or '?'.
++    function sanitize(s) {
++        let out = '';
++        for (const ch of s.replace(/\s+/g, ' ').trim()) {
++            if (typeable.has(ch)) {
++                out += ch;
++                continue;
++            }
++            let r = REPLACEMENTS[ch];
++            if (r === undefined) {
++                r = ch.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
++            }
++            out += Array.from(r).every(c => typeable.has(c)) ? r : '?';
++        }
++        return out;
++    }
++
++    // ---------------------------------------------------------------------
++    // Geometry
++    // ---------------------------------------------------------------------
++
++    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
++    const apply = (m, p) => ({ x: m.a * p.x + m.c * p.y + m.e, y: m.b * p.x + m.d * p.y + m.f });
++    const scaleOf = m => Math.sqrt(Math.abs(m.a * m.d - m.b * m.c));
++    const length = line => line.reduce((s, p, i) => i ? s + dist(line[i - 1], p) : 0, 0);
++    const lerp = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
++
++    // extent returns the smallest and largest f(p) over the points of all lines
++    // (without spreading thousands of points into Math.min).
++    function extent(lines, f) {
++        let lo = Infinity, hi = -Infinity;
++        for (const line of lines) {
++            for (const p of line) {
++                const v = f(p);
++                if (v < lo) lo = v;
++                if (v > hi) hi = v;
++            }
++        }
++        return [lo, hi];
++    }
++
++    // dashPattern returns the on/off lengths of a computed stroke-dasharray,
++    // or null for a solid line.
++    function dashPattern(value, scale) {
++        if (!value || value === 'none') return null;
++        let v = value.split(/[\s,]+/).map(parseFloat).filter(x => x >= 0);
++        if (v.length % 2) v = v.concat(v);
++        if (!v.length || v.every((x, i) => i % 2 === 0 || x === 0) || v.every(x => x * scale < 1.5)) return null;
++        // Dashes this small would merge into a line on e-ink.
++        return v.map(x => Math.max(x * scale * 2, 8));
++    }
++
++    // samplePolylines returns the outline of a geometry element as polylines
++    // in root coordinates, split where the outline jumps (subpaths).
++    function samplePolylines(el, m) {
++        const tag = el.tagName.toLowerCase();
++        if (tag === 'rect' && !(el.rx.baseVal.value > 0) && !(el.ry.baseVal.value > 0)) {
++            const x = el.x.baseVal.value, y = el.y.baseVal.value, w = el.width.baseVal.value, h = el.height.baseVal.value;
++            if (!(w > 0 && h > 0)) return [];
++            return [[{ x, y }, { x: x + w, y }, { x: x + w, y: y + h }, { x, y: y + h }, { x, y }].map(p => apply(m, p))];
++        }
++        if (tag === 'line') {
++            return [[{ x: el.x1.baseVal.value, y: el.y1.baseVal.value }, { x: el.x2.baseVal.value, y: el.y2.baseVal.value }].map(p => apply(m, p))];
++        }
++        if (tag === 'polyline' || tag === 'polygon') {
++            const pts = Array.from(el.points, p => apply(m, p));
++            if (tag === 'polygon' && pts.length > 2) pts.push(pts[0]);
++            return pts.length > 1 ? [pts] : [];
++        }
++        let len;
++        try {
++            len = el.getTotalLength();
++        } catch (e) {
++            return [];
++        }
++        if (!(len > 0)) return [];
++        const n = Math.max(2, Math.ceil(len * scaleOf(m) / SAMPLE_STEP));
++        const lines = [];
++        let cur = [];
++        for (let i = 0; i <= n; i++) {
++            const q = apply(m, el.getPointAtLength(len * i / n));
++            if (cur.length && dist(cur[cur.length - 1], q) > SAMPLE_STEP * 4) {
++                if (cur.length > 1) lines.push(cur);
++                cur = [];
++            }
++            cur.push(q);
++        }
++        if (cur.length > 1) lines.push(cur);
++        return lines;
++    }
++
++    // simplify drops points that lie on a straight line (Ramer-Douglas-Peucker).
++    function simplify(pts, eps) {
++        if (pts.length < 3) return pts;
++        const keep = new Uint8Array(pts.length);
++        keep[0] = keep[pts.length - 1] = 1;
++        const stack = [[0, pts.length - 1]];
++        while (stack.length) {
++            const [i, j] = stack.pop();
++            const a = pts[i], b = pts[j];
++            const len = dist(a, b) || 1e-9;
++            let best = -1, bestD = eps;
++            for (let k = i + 1; k < j; k++) {
++                const p = pts[k];
++                const d = len > 1e-6
++                    ? Math.abs((b.x - a.x) * (a.y - p.y) - (a.x - p.x) * (b.y - a.y)) / len
++                    : dist(a, p);
++                if (d > bestD) { best = k; bestD = d; }
++            }
++            if (best >= 0) {
++                keep[best] = 1;
++                stack.push([i, best], [best, j]);
++            }
++        }
++        return pts.filter((_, k) => keep[k]);
++    }
++
++    // densify splits straight moves longer than max, so that the pen moves
++    // in small steps like a real one.
++    function densify(pts, max) {
++        const out = [pts[0]];
++        for (let i = 1; i < pts.length; i++) {
++            const n = Math.ceil(dist(pts[i - 1], pts[i]) / max);
++            for (let k = 1; k <= n; k++) out.push(lerp(pts[i - 1], pts[i], k / n));
++        }
++        return out;
++    }
++
++    // penStrokes cuts a polyline into pen strokes at its sharp corners.
++    // xochitl smooths strokes along their path, so a pen that turns a sharp
++    // corner overshoots it by several pixels, however slowly it goes; separate
++    // strokes keep edges straight. The pieces overlap a little so that the
++    // corners close.
++    function penStrokes(pts) {
++        const sharp = (a, b, c) => {
++            const d = Math.atan2(c.y - b.y, c.x - b.x) - Math.atan2(b.y - a.y, b.x - a.x);
++            return Math.abs(Math.atan2(Math.sin(d), Math.cos(d))) > Math.PI / 6;
++        };
++        const n = pts.length;
++        const closed = n > 3 && dist(pts[0], pts[n - 1]) < 0.5 && sharp(pts[n - 2], pts[0], pts[1]);
++        const extend = (from, to) => {
++            const l = dist(from, to) || 1;
++            return { x: to.x + (to.x - from.x) / l * CORNER_OVERLAP, y: to.y + (to.y - from.y) / l * CORNER_OVERLAP };
++        };
++        const out = [];
++        let start = 0;
++        for (let i = 1; i < n; i++) {
++            if (i < n - 1 && !sharp(pts[i - 1], pts[i], pts[i + 1])) continue;
++            const piece = pts.slice(start, i + 1);
++            if (start > 0 || closed) piece[0] = extend(piece[1], piece[0]);
++            if (i < n - 1 || closed) piece[piece.length - 1] = extend(piece[piece.length - 2], piece[piece.length - 1]);
++            out.push(densify(piece, PEN_STEP));
++            start = i;
++        }
++        return out;
++    }
++
++    // dash cuts a polyline into dashes. pattern alternates on and off lengths.
++    function dash(pts, pattern) {
++        const out = [];
++        let idx = 0, left = pattern[0], on = true;
++        let cur = [pts[0]];
++        for (let i = 1; i < pts.length; i++) {
++            const a = pts[i - 1], b = pts[i];
++            const len = dist(a, b);
++            let t = 0;
++            while (len - t > left) {
++                t += left;
++                const p = { x: a.x + (b.x - a.x) * t / len, y: a.y + (b.y - a.y) * t / len };
++                if (on) {
++                    cur.push(p);
++                    out.push(cur);
++                } else {
++                    cur = [p];
++                }
++                on = !on;
++                idx = (idx + 1) % pattern.length;
++                left = pattern[idx];
++            }
++            left -= len - t;
++            if (on) cur.push(b);
++        }
++        if (on && cur.length > 1) out.push(cur);
++        return out;
++    }
++
++    // clipSegment returns the part [t0, t1] of the segment a-b inside the
++    // rectangle r (Liang-Barsky); t0 >= t1 when it misses r.
++    function clipSegment(a, b, r) {
++        const dx = b.x - a.x, dy = b.y - a.y;
++        let t0 = 0, t1 = 1;
++        for (const [p, q] of [[-dx, a.x - r.x0], [dx, r.x1 - a.x], [-dy, a.y - r.y0], [dy, r.y1 - a.y]]) {
++            if (p === 0) {
++                if (q < 0) return [1, 0]; // parallel to an edge, outside
++            } else if (p < 0) {
++                t0 = Math.max(t0, q / p);
++            } else {
++                t1 = Math.min(t1, q / p);
++            }
++        }
++        return [t0, t1];
++    }
++
++    // clip returns the pieces of a polyline inside (or, with outside set,
++    // outside) the rectangle r.
++    function clip(line, r, outside) {
++        const pieces = [];
++        let cur = null;
++        const add = (p, q) => {
++            if (!cur) cur = [p];
++            cur.push(q);
++        };
++        const end = () => {
++            if (cur && cur.length > 1) pieces.push(cur);
++            cur = null;
++        };
++        for (let i = 1; i < line.length; i++) {
++            const a = line[i - 1], b = line[i];
++            const [t0, t1] = clipSegment(a, b, r);
++            if (t0 >= t1) {
++                if (outside) add(a, b); else end();
++                continue;
++            }
++            if (outside) {
++                if (t0 > 0) add(a, lerp(a, b, t0));
++                end();
++                if (t1 < 1) add(lerp(a, b, t1), b);
++            } else {
++                if (t0 > 0) end();
++                add(lerp(a, b, t0), lerp(a, b, t1));
++                if (t1 < 1) end();
++            }
++        }
++        end();
++        return pieces;
++    }
++
++    function area(poly) {
++        let s = 0;
++        for (let i = 1; i < poly.length; i++) {
++            s += poly[i - 1].x * poly[i].y - poly[i].x * poly[i - 1].y;
++        }
++        return Math.abs(s) / 2;
++    }
++
++    // hatch fills a closed outline with horizontal lines, as one zigzag that
++    // penStrokes later cuts at its turns.
++    function hatch(poly, spacing) {
++        const ys = poly.map(p => p.y);
++        const top = Math.min(...ys), bottom = Math.max(...ys);
++        const zigzag = [];
++        let flip = false;
++        for (let y = top + spacing / 2; y < bottom; y += spacing) {
++            const xs = [];
++            for (let i = 1; i < poly.length; i++) {
++                const a = poly[i - 1], b = poly[i];
++                if ((a.y <= y && b.y > y) || (b.y <= y && a.y > y)) {
++                    xs.push(a.x + (y - a.y) * (b.x - a.x) / (b.y - a.y));
++                }
++            }
++            if (xs.length < 2) continue;
++            const x0 = Math.min(...xs), x1 = Math.max(...xs);
++            const row = [{ x: x0, y }, { x: x1, y }];
++            zigzag.push(...(flip ? row.reverse() : row));
++            flip = !flip;
++        }
++        return zigzag.length > 1 ? [zigzag] : [];
++    }
++
++    // paint parses a computed fill or stroke colour; null when invisible.
++    function paint(value, opacity) {
++        const m = /rgba?\(([^)]+)\)/.exec(value || '');
++        if (!m) return null;
++        const [r, g, b, a = 1] = m[1].split(/[\s,/]+/).filter(Boolean).map(Number);
++        const alpha = a * (opacity === undefined || opacity === '' ? 1 : parseFloat(opacity));
++        if (!(alpha > 0.05)) return null;
++        return { lum: (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255, alpha };
++    }
++
++    // ---------------------------------------------------------------------
++    // Reading the rendered diagram
++    // ---------------------------------------------------------------------
++
++    // outline adds the strokes of one geometry element (and the fill of a
++    // small dark shape) to out.
++    function outline(el, m, style, out) {
++        const scale = scaleOf(m);
++        const stroke = paint(style.stroke, style.strokeOpacity);
++        const fill = paint(style.fill, style.fillOpacity);
++        const width = parseFloat(style.strokeWidth) * scale;
++        const drawStroke = stroke && stroke.lum < 0.9 && width > 0.2;
++        const darkFill = fill && fill.lum < 0.5;
++        if (!drawStroke && !darkFill) return null;
++        const lines = samplePolylines(el, m);
++        const pattern = drawStroke && dashPattern(style.strokeDasharray, scale);
++        for (const line of lines) {
++            out.push(...(pattern ? dash(line, pattern) : [line]));
++            // Fill dark shapes with lines, except small ones (arrowheads): pen
++            // strokes that short come out as blots, the outline reads better.
++            const closed = line.length > 3 && dist(line[0], line[line.length - 1]) < 1;
++            if (darkFill && closed && area(line) > 400 && area(line) < 3000) {
++                out.push(...hatch(line, 3));
++            }
++        }
++        return { lines, width };
++    }
++
++    // drawMarker adds the strokes of an arrowhead (or another marker) at one
++    // end of a polyline.
++    function drawMarker(svg, url, line, atEnd, strokeWidth, out) {
++        const id = /#([^"')]+)/.exec(url || '');
++        const marker = id && svg.querySelector('marker#' + CSS.escape(id[1]));
++        if (!marker || line.length < 2) return;
++        const p = atEnd ? line[line.length - 1] : line[0];
++        let q = null;
++        for (let i = 1; i < line.length && !q; i++) {
++            const c = atEnd ? line[line.length - 1 - i] : line[i];
++            if (dist(c, p) > 0.5) q = c;
++        }
++        if (!q) return;
++        let angle = atEnd ? Math.atan2(p.y - q.y, p.x - q.x) : Math.atan2(q.y - p.y, q.x - p.x);
++        const orient = marker.getAttribute('orient') || '0';
++        if (orient === 'auto-start-reverse' && !atEnd) {
++            angle += Math.PI;
++        } else if (orient !== 'auto' && orient !== 'auto-start-reverse') {
++            angle = (parseFloat(orient) || 0) * Math.PI / 180;
++        }
++        const units = marker.getAttribute('markerUnits') === 'userSpaceOnUse' ? 1 : strokeWidth;
++        const vb = marker.viewBox.baseVal;
++        let s = 1;
++        if (vb && vb.width > 0 && vb.height > 0) {
++            s = Math.min(marker.markerWidth.baseVal.value / vb.width, marker.markerHeight.baseVal.value / vb.height);
++        }
++        const base = new DOMMatrix()
++            .translate(p.x, p.y)
++            .rotate(angle * 180 / Math.PI)
++            .scale(units * s * MARKER_SCALE)
++            .translate(-marker.refX.baseVal.value, -marker.refY.baseVal.value);
++        for (const el of marker.querySelectorAll('path, line, polyline, polygon, rect, circle, ellipse')) {
++            const local = el.transform && el.transform.baseVal.consolidate();
++            const m = local ? base.multiply(DOMMatrix.fromMatrix(local.matrix)) : base;
++            outline(el, m, getComputedStyle(el), out);
++        }
++    }
++
++    // lineElements returns the elements holding the lines of a <text>: its
++    // positioned <tspan>s, or the text itself.
++    function lineElements(text) {
++        const lines = Array.from(text.children).filter(c =>
++            c.tagName.toLowerCase() === 'tspan' && (c.hasAttribute('x') || c.hasAttribute('y') || c.hasAttribute('dy')));
++        return lines.length ? lines : [text];
++    }
++
++    // extract reads labels and strokes from a rendered diagram, in the
++    // coordinates of its root <svg> (pixels at the tablet's text size).
++    function extract(svg) {
++        measure(' ');
++        const metrics = measureCtx.measureText('Hg');
++        const ascent = metrics.fontBoundingBoxAscent / (metrics.fontBoundingBoxAscent + metrics.fontBoundingBoxDescent) || 0.787;
++        const rootInv = svg.getScreenCTM().inverse();
++        const toRoot = el => rootInv.multiply(el.getScreenCTM());
++        const warnings = new Set();
++        const labels = [];
++        for (const text of svg.querySelectorAll('text')) {
++            if (!text.getClientRects().length || text.closest('defs, marker')) continue;
++            for (const el of lineElements(text)) {
++                const content = el.textContent.replace(/\s+/g, ' ').trim();
++                if (!content || !el.getNumberOfChars()) continue;
++                const m = toRoot(el);
++                if (Math.abs(m.b) > 1e-3 || Math.abs(m.c) > 1e-3) {
++                    warnings.add('Rotated labels are left out: the tablet can only type horizontal text.');
++                    continue;
++                }
++                const size = parseFloat(getComputedStyle(el).fontSize) * scaleOf(m);
++                if (Math.abs(size - TEXT.size) > 1.5) {
++                    warnings.add(`Some labels are ${Math.round(size)} px in this diagram type; they are typed at ${TEXT.size} px and may not fit their boxes.`);
++                }
++                // The baseline from the box of the first glyph, whatever the
++                // dominant-baseline of the text.
++                const start = el.getStartPositionOfChar(0);
++                const cell = el.getExtentOfChar(0);
++                const p = apply(m, { x: start.x, y: cell.y + cell.height * ascent });
++                labels.push({ text: content, x: p.x, baseline: p.y });
++            }
++        }
++        if (svg.querySelector('foreignObject')) {
++            warnings.add('Some parts of this diagram are HTML; they are left out.');
++        }
++        const strokes = [];
++        for (const el of svg.querySelectorAll('path, line, polyline, polygon, rect, circle, ellipse')) {
++            if (el.closest('defs, marker, clipPath, mask, pattern, symbol') || !el.getClientRects().length) continue;
++            const style = getComputedStyle(el);
++            if (style.visibility === 'hidden' || parseFloat(style.opacity) === 0) continue;
++            const drawn = outline(el, toRoot(el), style, strokes);
++            if (!drawn) continue;
++            for (const line of drawn.lines) {
++                if (style.markerStart !== 'none') drawMarker(svg, style.markerStart, line, false, drawn.width, strokes);
++                if (style.markerEnd !== 'none') drawMarker(svg, style.markerEnd, line, true, drawn.width, strokes);
++            }
++        }
++        // Mermaid lets some lines run past the picture (sequence lifelines)
++        // and relies on the viewBox to cut them.
++        const vb = svg.viewBox.baseVal;
++        const visible = vb && vb.width > 0
++            ? strokes.flatMap(line => clip(line, { x0: vb.x, y0: vb.y, x1: vb.x + vb.width, y1: vb.y + vb.height }))
++            : strokes;
++        return { labels, strokes: visible, warnings: Array.from(warnings) };
++    }
++
++    // ---------------------------------------------------------------------
++    // Layout on the lines of the tablet's text
++    // ---------------------------------------------------------------------
++
++    // tooWide reports labels that do not fit a line of the tablet's text;
++    // makePlan then tries a more compact layout.
++    function tooWide(span) {
++        const e = new Error(`The diagram is too wide for the tablet's text, even laid out compactly: its labels span ${Math.round(span)} px, a line holds ${TEXT.columnWidth} px. Shorten the labels or split the diagram.`);
++        e.wide = true;
++        throw e;
++    }
++
++    function layout(diagram) {
++        const P = TEXT.linePitch;
++        const space = measure(' ');
++        const warnings = diagram.warnings.slice();
++        const labels = diagram.labels
++            .map(l => Object.assign({}, l, { text: sanitize(l.text) }))
++            .filter(l => l.text);
++        if (diagram.labels.some(l => sanitize(l.text) !== l.text.replace(/\s+/g, ' ').trim())) {
++            warnings.push('Characters the tablet keyboard cannot type were replaced (e.g. ą → a, [ → ().');
++        }
++        for (const l of labels) l.width = measure(l.text);
++        if (!diagram.strokes.length && !labels.length) throw new Error('The diagram is empty.');
++
++        // Labels whose baselines are close share a text line, unless they overlap.
++        labels.sort((a, b) => a.baseline - b.baseline || a.x - b.x);
++        const rows = [];
++        for (const l of labels) {
++            const row = rows[rows.length - 1];
++            const clash = row && row.labels.some(o => l.x < o.x + o.width + space && o.x < l.x + l.width + space);
++            if (row && l.baseline - row.first <= ROW_TOLERANCE && !clash) {
++                row.labels.push(l);
++            } else {
++                rows.push({ first: l.baseline, labels: [l] });
++            }
++        }
++        let index = 0;
++        rows.forEach((row, i) => {
++            row.y = row.labels.reduce((s, l) => s + l.baseline, 0) / row.labels.length;
++            if (i > 0) {
++                row.y = Math.max(row.y, rows[i - 1].y + 0.5);
++                // Squeezing rows together more than this pushes lines that
++                // run between them (box edges, dividers) into the text.
++                const gap = row.y - rows[i - 1].y;
++                let n = Math.max(1, Math.round(gap / P));
++                if (n * P < gap * 0.85) n++;
++                index += n;
++            }
++            row.index = index;
++        });
++
++        // Horizontally: labels centred in the text column, strokes on the page.
++        const [minX, maxX] = extent(diagram.strokes, p => p.x);
++        let tx;
++        if (labels.length) {
++            const [left] = extent([labels], l => l.x);
++            const [, right] = extent([labels], l => l.x + l.width);
++            if (right - left > TEXT.columnWidth - 2 * space) tooWide(right - left);
++            tx = TEXT.left + (TEXT.columnWidth - (right - left)) / 2 - left;
++            if (minX + tx < PAGE_MARGIN.left) {
++                tx = PAGE_MARGIN.left - minX;
++            } else if (maxX + tx > screenWidth - PAGE_MARGIN.right) {
++                tx = screenWidth - PAGE_MARGIN.right - maxX;
++            }
++            if (left + tx < TEXT.left - 0.5 || right + tx > TEXT.left + TEXT.columnWidth) tooWide(maxX - minX);
++        } else {
++            tx = (screenWidth - maxX - minX) / 2;
++        }
++
++        // Vertically: a piecewise-linear stretch that puts every label row on
++        // its text line; above the first and below the last row it only
++        // shifts. offset is the number of empty text lines before the first
++        // row, which keep the diagram clear of the top of the page.
++        const warpWith = offset => {
++            const anchors = rows.map(r => [r.y, TEXT.firstBaseline + (r.index + 1 + offset) * P]);
++            if (!anchors.length) anchors.push([extent(diagram.strokes, p => p.y)[0], PAGE_MARGIN.top + 40]);
++            return y => {
++                let k = 0;
++                while (k < anchors.length - 1 && y > anchors[k + 1][0]) k++;
++                const [s0, d0] = anchors[k];
++                if (y <= s0 || k === anchors.length - 1) return y - s0 + d0;
++                const [s1, d1] = anchors[k + 1];
++                return d0 + (y - s0) * (d1 - d0) / (s1 - s0);
++            };
++        };
++        let offset = 0;
++        let warp = warpWith(0);
++        const [highest] = extent(diagram.strokes, p => warp(p.y));
++        if (rows.length && highest < PAGE_MARGIN.top) {
++            offset = Math.ceil((PAGE_MARGIN.top - highest) / P);
++            warp = warpWith(offset);
++        }
++
++        // The text, typed as a new paragraph: an empty line (so that a label
++        // like "- x" cannot start a list), then one line per row with the
++        // labels moved right with spaces.
++        const lines = [];
++        const boxes = []; // where the typed labels will be: strokes stay out
++        const last = rows.length ? rows[rows.length - 1].index : -1;
++        for (let i = 0; i < offset; i++) lines.push('');
++        for (let i = 0; i <= last; i++) {
++            const row = rows.find(r => r.index === i);
++            const baseline = TEXT.firstBaseline + (lines.length + 1) * P;
++            let line = '';
++            for (const l of row ? row.labels.sort((a, b) => a.x - b.x) : []) {
++                const target = l.x + tx;
++                let n = Math.round((target - TEXT.left - measure(line)) / space);
++                if (line && n < 1) {
++                    n = 1;
++                    warnings.push(`"${l.text}" is moved right: it is too close to the label before it.`);
++                }
++                line += ' '.repeat(Math.max(0, n));
++                const x = TEXT.left + measure(line);
++                const ink = measureCtx.measureText(l.text);
++                boxes.push({
++                    x0: x - ink.actualBoundingBoxLeft - 3, x1: x + ink.actualBoundingBoxRight + 3,
++                    y0: baseline - ink.actualBoundingBoxAscent - 3, y1: baseline + ink.actualBoundingBoxDescent + 3
++                });
++                line += l.text;
++            }
++            if (measure(line) > TEXT.columnWidth) tooWide(measure(line));
++            lines.push(line);
++        }
++
++        // The strokes, minus their parts under labels (Mermaid hides the
++        // lines behind edge labels with a background).
++        let strokes = diagram.strokes.map(line => line.map(p => ({ x: p.x + tx, y: warp(p.y) })));
++        for (const box of boxes) {
++            strokes = strokes.flatMap(line => clip(line, box, true));
++        }
++        strokes = strokes
++            .flatMap(line => penStrokes(simplify(line, 0.35)))
++            .filter(line => line.length > 1 && length(line) >= 3); // drop specks left by the cuts
++        // A diagram taller than the screen is drawn in parts, scrolling the
++        // page with the text cursor in between (drawOnTablet). That needs
++        // labels on every screen, to find where the page is.
++        const [top, bottom] = extent(strokes, p => p.y);
++        const tall = bottom > screenHeight - PAGE_MARGIN.bottom;
++        if (tall) {
++            const screen = screenHeight - PAGE_MARGIN.top - PAGE_MARGIN.bottom - 300;
++            const ys = lines.map((t, i) => t.trim() ? TEXT.firstBaseline + (i + 1) * P : null).filter(y => y !== null);
++            const gaps = [ys[0] - top, bottom - ys[ys.length - 1]];
++            for (let i = 1; i < ys.length; i++) gaps.push(ys[i] - ys[i - 1]);
++            if (!ys.length || Math.max(...gaps) > screen) {
++                throw new Error('The diagram is taller than the screen and has a part taller than the screen without any labels. The tablet scrolls by its text, so it cannot draw that part.');
++            }
++        }
++        // Empty lines below the last row, so that the text cursor at the end
++        // scrolls the bottom of the diagram into view (xochitl keeps about a
++        // sixth of the screen below the cursor).
++        const lastLine = TEXT.firstBaseline + lines.length * P;
++        for (let i = Math.ceil((bottom - lastLine - 250) / P); i > 0; i--) lines.push('');
++
++        return {
++            text: lines.length ? '\u2028' + lines.join('\u2028') : '',
++            rows: lines.map((t, i) => ({ text: t, baseline: TEXT.firstBaseline + (i + 1) * P })),
++            strokes,
++            top,
++            bottom,
++            tall,
++            warnings
++        };
++    }
++
++    // makePlan lays the diagram out for the tablet, more compactly if its
++    // labels do not fit a line of text, and as a last resort turns a
++    // left-to-right flowchart top-to-bottom.
++    async function makePlan(source) {
++        await load();
++        const attempts = COMPACT.map(c => ({ source, compact: c }));
++        const turned = source.replace(/^(\s*(?:flowchart|graph)\s+)(LR|RL)\b/m, '$1TB');
++        if (turned !== source) attempts.push(...COMPACT.map(c => ({ source: turned, compact: c, turned: true })));
++        let wide = null;
++        for (const a of attempts) {
++            try {
++                const p = await render(a.source, a.compact);
++                if (a.turned) {
++                    p.warnings.unshift('Drawn top to bottom: left to right it is too wide for the tablet\'s text.');
++                } else if (a.compact !== COMPACT[0]) {
++                    p.warnings.unshift('Laid out more compactly than Mermaid would, to fit a line of the tablet\'s text.');
++                }
++                return p;
++            } catch (e) {
++                if (!e.wide) throw e;
++                wide = e;
++            }
++        }
++        throw wide;
++    }
++
++    async function render(source, compact) {
++        window.mermaid.initialize(mermaidConfig(compact));
++        const host = document.getElementById('mermaidMeasure');
++        host.textContent = '';
++        const { svg } = await window.mermaid.render('rmMermaid' + (++renderSeq), source);
++        host.innerHTML = svg;
++        const el = host.querySelector('svg');
++        const vb = el.viewBox.baseVal;
++        if (vb && vb.width > 0) {
++            el.setAttribute('width', vb.width);
++            el.setAttribute('height', vb.height);
++        }
++        el.style.maxWidth = 'none';
++        try {
++            return layout(extract(el));
++        } finally {
++            host.textContent = '';
++        }
++    }
++
++    // ---------------------------------------------------------------------
++    // Finding the typed text on the screen
++    // ---------------------------------------------------------------------
++
++    async function grabScreen() {
++        const res = await fetch('/screenshot', { cache: 'no-store' });
++        if (!res.ok) throw new Error('screenshot: HTTP ' + res.status);
++        const bmp = await createImageBitmap(await res.blob());
++        const c = document.createElement('canvas');
++        c.width = bmp.width;
++        c.height = bmp.height;
++        const ctx = c.getContext('2d', { willReadFrequently: true });
++        ctx.drawImage(bmp, 0, 0);
++        const d = ctx.getImageData(0, 0, c.width, c.height).data;
++        const gray = new Uint8Array(c.width * c.height);
++        for (let i = 0; i < gray.length; i++) {
++            gray[i] = (d[4 * i] * 77 + d[4 * i + 1] * 150 + d[4 * i + 2] * 29) >> 8;
++        }
++        return { width: c.width, height: c.height, gray };
++    }
++
++    // stableScreen waits until the screen stops changing and returns it:
++    // xochitl lays typed text out more slowly than the keys arrive, and
++    // scrolls the page while it does.
++    async function stableScreen() {
++        let prev = await grabScreen();
++        for (let i = 0; i < 40; i++) {
++            await sleep(700);
++            const cur = await grabScreen();
++            let changed = 0;
++            for (let k = 0; k < cur.gray.length; k += 4) {
++                if (Math.abs(cur.gray[k] - prev.gray[k]) > 60) changed++;
++            }
++            if (changed < 100) return cur;
++            prev = cur;
++        }
++        return prev;
++    }
++
++    // textTemplate renders the text lines of a plan the way the tablet will
++    // show them: the pixels of every glyph, in plan coordinates, and the same
++    // on 8x8 cells for a coarse search.
++    function textTemplate(rows) {
++        const c = document.createElement('canvas');
++        c.width = screenWidth;
++        c.height = 64;
++        const ctx = c.getContext('2d', { willReadFrequently: true });
++        ctx.font = `${TEXT.size}px "${TEXT.font}"`;
++        const xs = [], ys = [], cells = new Set();
++        for (const r of rows) {
++            if (!r.text.trim()) continue;
++            ctx.clearRect(0, 0, c.width, c.height);
++            ctx.fillText(r.text, TEXT.left, 44);
++            const a = ctx.getImageData(0, 0, c.width, c.height).data;
++            for (let i = 3; i < a.length; i += 4) {
++                if (a[i] < 128) continue;
++                const x = (i >> 2) % c.width, y = Math.round(r.baseline) - 44 + ((i >> 2) / c.width | 0);
++                xs.push(x);
++                ys.push(y);
++                cells.add((y >> 3) * 4096 + (x >> 3));
++            }
++        }
++        const cx = [], cy = [];
++        for (const k of cells) {
++            cx.push(k % 4096);
++            cy.push(Math.floor(k / 4096));
++        }
++        return { xs, ys, cx, cy };
++    }
++
++    // inkMasks returns the dark pixels of a screenshot without the lone dots
++    // of a grid or dotted page template (text and strokes have neighbours),
++    // grown by two pixels to forgive antialiasing, and the same on 8x8 cells.
++    function inkMasks(shot) {
++        const W = shot.width, H = shot.height, g = shot.gray;
++        let ink = new Uint8Array(W * H);
++        for (let y = 1; y < H - 1; y++) {
++            for (let x = 1; x < W - 1; x++) {
++                const i = y * W + x;
++                if (g[i] >= 100) continue;
++                if (g[i - 1] < 100 || g[i + 1] < 100 || g[i - W] < 100 || g[i + W] < 100 ||
++                    g[i - W - 1] < 100 || g[i - W + 1] < 100 || g[i + W - 1] < 100 || g[i + W + 1] < 100) {
++                    ink[i] = 1;
++                }
++            }
++        }
++        const WS = Math.ceil(W / 8), HS = Math.ceil(H / 8);
++        const cells = new Uint8Array(WS * HS);
++        for (let i = 0; i < ink.length; i++) if (ink[i]) cells[((i / W | 0) >> 3) * WS + ((i % W) >> 3)] = 1;
++        for (let pass = 0; pass < 2; pass++) {
++            const grown = new Uint8Array(W * H);
++            for (let i = W; i < ink.length - W; i++) {
++                grown[i] = ink[i] | ink[i - 1] | ink[i + 1] | ink[i - W] | ink[i + W];
++            }
++            ink = grown;
++        }
++        return { W, H, ink, WS, HS, cells };
++    }
++
++    // findText looks for the typed text on a screenshot and returns where it
++    // could be relative to the plan: matches {dx, dy, score}, best first,
++    // searching offsets in the ranges dx and dy ([min, max], px). There can
++    // be more than one: the same diagram drawn twice on a page, or labels
++    // that repeat (a sequence diagram matches itself a few lines off).
++    function findText(shot, tpl, dx, dy) {
++        const m = inkMasks(shot);
++        const score = (xs, ys, grid, gw, gh, ox, oy) => {
++            let hit = 0, seen = 0;
++            for (let k = 0; k < xs.length; k++) {
++                const x = xs[k] + ox, y = ys[k] + oy;
++                if (x < 0 || y < 0 || x >= gw || y >= gh) continue;
++                seen++;
++                hit += grid[y * gw + x];
++            }
++            return { hit, seen };
++        };
++        // Good offsets explain the most text on the screen: hits minus
++        // misses, rather than a ratio, which a sliver of text at the edge of
++        // the screen could top. A few of the best coarse ones are refined.
++        const coarse = [];
++        for (let oy = Math.floor(dy[0] / 8); oy <= Math.ceil(dy[1] / 8); oy++) {
++            for (let ox = Math.floor(dx[0] / 8); ox <= Math.ceil(dx[1] / 8); ox++) {
++                const r = score(tpl.cx, tpl.cy, m.cells, m.WS, m.HS, ox, oy);
++                coarse.push({ ox, oy, v: 2 * r.hit - r.seen });
++            }
++        }
++        coarse.sort((a, b) => b.v - a.v);
++        const picked = [];
++        for (const c of coarse) {
++            if (picked.length === 6) break;
++            if (c.v > 0 && picked.every(o => Math.abs(o.oy - c.oy) > 4)) picked.push(c);
++        }
++        const found = [];
++        for (const c of picked) {
++            let fine = null;
++            for (let oy = c.oy * 8 - 10; oy <= c.oy * 8 + 10; oy++) {
++                for (let ox = c.ox * 8 - 10; ox <= c.ox * 8 + 10; ox++) {
++                    const r = score(tpl.xs, tpl.ys, m.ink, m.W, m.H, ox, oy);
++                    const v = 2 * r.hit - r.seen;
++                    if (!fine || v > fine.v) fine = { dx: ox, dy: oy, v, score: r.seen ? r.hit / r.seen : 0, seen: r.seen };
++                }
++            }
++            if (fine.seen >= Math.min(tpl.xs.length, 300)) found.push(fine);
++        }
++        const top = Math.max(0, ...found.map(f => f.score));
++        return found.filter(f => f.score >= 0.75 && f.score >= top - 0.1).sort((a, b) => b.score - a.score);
++    }
++
++    // ---------------------------------------------------------------------
++    // Drawing jobs
++    // ---------------------------------------------------------------------
++
++    async function runJob(body, onProgress, signal) {
++        const res = await fetch('/draw', {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify(body),
++            signal
++        });
++        if (!res.ok) throw new Error((await res.text()).trim() || 'HTTP ' + res.status);
++        const reader = res.body.getReader();
++        const decoder = new TextDecoder();
++        let buf = '';
++        for (;;) {
++            const { value, done } = await reader.read();
++            if (done) throw new Error('the connection to the tablet was lost');
++            buf += decoder.decode(value, { stream: true });
++            let nl;
++            while ((nl = buf.indexOf('\n')) >= 0) {
++                const msg = JSON.parse(buf.slice(0, nl));
++                buf = buf.slice(nl + 1);
++                if (msg.error) throw new Error(msg.error);
++                if (msg.ok) return;
++                if (msg.phase === 'waiting') {
++                    setStatus('Waiting for the tablet to catch up…');
++                } else {
++                    onProgress(msg);
++                }
++            }
++        }
++    }
++
++    const sleep = ms => new Promise(r => setTimeout(r, ms));
++
++    // toPen converts strokes on the screen to the proxy's normalised pen
++    // coordinates.
++    const toPen = strokes => strokes.map(line => line.flatMap(p => [
++        +((p.x - PEN_MAP.ox) / PEN_MAP.sx / screenWidth).toFixed(5),
++        +((p.y - PEN_MAP.oy) / PEN_MAP.sy / screenHeight).toFixed(5)
++    ]));
++
++    // drawOnTablet types the labels, then draws the strokes where the text
++    // landed. A diagram taller than the screen is drawn in parts from the
++    // bottom up: xochitl scrolls to the end of the text while typing, and
++    // moving the text cursor up scrolls it back, part by part. After every
++    // move a screenshot tells where the page is.
++    async function drawOnTablet() {
++        if (!plan || job) return;
++        if (typeof deviceOrientation === 'string' && deviceOrientation !== 'Portrait') {
++            setStatus('Turn the tablet to portrait first: the text grid is measured in portrait.', true);
++            return;
++        }
++        if (typeof drawMode !== 'undefined' && drawMode) setDrawMode(false);
++        job = new AbortController();
++        const signal = job.signal;
++        updateButtons();
++        try {
++            if (!plan.text) {
++                await runJob({ strokes: toPen(plan.strokes) }, p => setStatus(`Drawing… ${Math.round(100 * p.done / p.total)}%`), signal);
++            } else {
++                await drawInParts(plan, signal);
++            }
++            setStatus('Done.');
++            showMessage('Diagram drawn on the tablet', MessageDuration.QUICK);
++        } catch (e) {
++            setStatus(signal.aborted ? 'Stopped.' : e.message, !signal.aborted);
++        } finally {
++            job = null;
++            updateButtons();
++        }
++    }
++
++    async function drawInParts(p, signal) {
++        const H = screenHeight;
++        const tpl = textTemplate(p.rows);
++
++        // look finds the text on the screen, its offset searched in the
++        // ranges dx and dy, and picks one of the matches.
++        const look = async (dx, dy, pick) => {
++            setStatus('Looking for the labels on the screen…');
++            await sleep(500);
++            const found = findText(await stableScreen(), tpl, dx, dy);
++            const choice = found.length ? pick(found) : null;
++            if (!choice) {
++                throw new Error('The typed labels were not found on the screen, so the rest was not drawn. ' +
++                    'Use a page in portrait, not zoomed, with the default text width, and do not touch it while it draws. Undo on the tablet and try again.');
++            }
++            return choice;
++        };
++
++        await runJob({ text: p.text }, q => setStatus(`Typing the labels… ${q.done}/${q.total} keys`), signal);
++        // Typing leaves the cursor, and the screen, at the last line.
++        const lastY = p.rows[p.rows.length - 1].baseline;
++        // The text just typed is the last on the page: of matches that are
++        // as good (the same diagram drawn before), take the lowest.
++        let view = await look([-160, 160], [-lastY, H - lastY],
++            found => found.filter(f => f.score >= found[0].score - 0.03).sort((a, b) => b.dy - a.dy)[0]);
++        if (p.bottom + view.dy > H - PAGE_MARGIN.bottom) {
++            throw new Error('The bottom of the diagram is below the screen, so nothing was drawn. Undo the text on the tablet and try again on an empty page.');
++        }
++        let drawn = Infinity; // everything below this (plan y) is drawn
++        for (let part = 1; ; part++) {
++            const from = PAGE_MARGIN.top - view.dy;
++            const to = Math.min(H - PAGE_MARGIN.bottom - view.dy, drawn);
++            // Pieces cut at the edges of a part overlap the next part a little.
++            const pieces = p.strokes
++                .flatMap(line => clip(line, { x0: -1e9, x1: 1e9, y0: from - CORNER_OVERLAP, y1: to + CORNER_OVERLAP }))
++                .filter(line => length(line) >= 1)
++                .map(line => line.map(q => ({ x: q.x + view.dx, y: q.y + view.dy })));
++            if (pieces.length) {
++                const label = p.tall ? `Drawing part ${part}…` : 'Drawing…';
++                await runJob({ strokes: toPen(pieces) }, q => setStatus(`${label} ${Math.round(100 * q.done / q.total)}%`), signal);
++            }
++            drawn = Math.min(drawn, from);
++            if (drawn <= p.top) return;
++
++            // The next part: Page Up scrolls 80 % of the screen, so the
++            // parts overlap; near the top of the page it scrolls less.
++            setStatus(`Scrolling to part ${part + 1}…`);
++            await runJob({ pagesUp: 1 }, () => {}, signal);
++            // Page Up moves the page by PAGE_STEP, less only at the top of
++            // the page, where the first labels, which do not repeat, are on
++            // the screen and the best match is right.
++            const expected = view.dy + PAGE_STEP * H;
++            const next = await look([view.dx - 16, view.dx + 16], [view.dy - 50, expected + 100],
++                found => found.find(f => Math.abs(f.dy - expected) <= 40) || found[0]);
++            if (next.dy <= view.dy + 20) {
++                throw new Error('The page did not scroll up, so the top of the diagram was not drawn.');
++            }
++            if (H - PAGE_MARGIN.bottom - next.dy < drawn - 10) {
++                throw new Error('The page scrolled too far, so the rest of the diagram was not drawn.');
++            }
++            view = next;
++        }
++    }
++
++    // ---------------------------------------------------------------------
++    // Dialog
++    // ---------------------------------------------------------------------
++
++    const SVG_NS = 'http://www.w3.org/2000/svg';
++
++    function buildDialog() {
++        const overlay = document.createElement('div');
++        overlay.id = 'mermaidOverlay';
++        overlay.className = 'help-overlay mermaid-overlay';
++        overlay.setAttribute('role', 'dialog');
++        overlay.setAttribute('aria-modal', 'true');
++        overlay.setAttribute('aria-labelledby', 'mermaidTitle');
++        overlay.innerHTML = `
++            <div class="help-content mermaid-content">
++                <button class="help-close" id="mermaidClose" aria-label="Close">&times;</button>
++                <h2 id="mermaidTitle">Mermaid diagram</h2>
++                <p class="mermaid-hint">Open an empty page in portrait and pick the fineliner on the tablet.
++                    Labels are typed with the tablet's text tool, boxes and arrows are drawn with the pen.</p>
++                <div class="mermaid-body">
++                    <textarea id="mermaidSource" spellcheck="false" aria-label="Mermaid source"></textarea>
++                    <div class="mermaid-preview" aria-label="Preview of the page"></div>
++                </div>
++                <ul class="mermaid-warnings"></ul>
++                <div class="mermaid-status" role="status"></div>
++                <div class="mermaid-actions">
++                    <button id="mermaidStop" class="mermaid-button">Stop</button>
++                    <button id="mermaidDraw" class="mermaid-button mermaid-primary">Draw on the tablet</button>
++                </div>
++            </div>
++            <div id="mermaidMeasure" class="mermaid-measure" aria-hidden="true"></div>`;
++        document.body.appendChild(overlay);
++
++        const source = overlay.querySelector('#mermaidSource');
++        try {
++            source.value = localStorage.getItem(STORAGE_KEY) || EXAMPLE;
++        } catch (e) {
++            source.value = EXAMPLE;
++        }
++        let timer = null;
++        source.addEventListener('input', () => {
++            try {
++                localStorage.setItem(STORAGE_KEY, source.value);
++            } catch (e) { /* private mode */ }
++            clearTimeout(timer);
++            timer = setTimeout(refresh, 500);
++        });
++        overlay.querySelector('#mermaidClose').addEventListener('click', closeDialog);
++        overlay.querySelector('#mermaidDraw').addEventListener('click', drawOnTablet);
++        overlay.querySelector('#mermaidStop').addEventListener('click', () => job && job.abort());
++        overlay.addEventListener('keydown', e => {
++            if (e.key === 'Escape') closeDialog();
++            e.stopPropagation(); // keep the viewer's shortcuts out of the editor
++        });
++        return overlay;
++    }
++
++    function dialog() {
++        return document.getElementById('mermaidOverlay') || buildDialog();
++    }
++
++    function setStatus(text, error) {
++        const el = dialog().querySelector('.mermaid-status');
++        el.textContent = text || '';
++        el.classList.toggle('error', !!error);
++    }
++
++    function updateButtons() {
++        const d = dialog();
++        d.querySelector('#mermaidDraw').disabled = !plan || !!job;
++        d.querySelector('#mermaidStop').style.display = job ? '' : 'none';
++        d.querySelector('#mermaidSource').readOnly = !!job;
++    }
++
++    function showWarnings(list) {
++        const ul = dialog().querySelector('.mermaid-warnings');
++        ul.textContent = '';
++        for (const w of list) {
++            const li = document.createElement('li');
++            li.textContent = w;
++            ul.appendChild(li);
++        }
++    }
++
++    // showPreview draws the planned page: typed text and pen strokes.
++    function showPreview(p) {
++        const box = dialog().querySelector('.mermaid-preview');
++        box.textContent = '';
++        if (!p) return;
++        const height = Math.max(screenHeight, p.bottom + PAGE_MARGIN.bottom);
++        const svg = document.createElementNS(SVG_NS, 'svg');
++        svg.setAttribute('viewBox', `0 0 ${screenWidth} ${height}`);
++        const page = document.createElementNS(SVG_NS, 'rect');
++        page.setAttribute('width', screenWidth);
++        page.setAttribute('height', height);
++        page.setAttribute('class', 'mermaid-page');
++        svg.appendChild(page);
++        for (const line of p.strokes) {
++            const pl = document.createElementNS(SVG_NS, 'polyline');
++            pl.setAttribute('points', line.map(q => `${q.x.toFixed(1)},${q.y.toFixed(1)}`).join(' '));
++            pl.setAttribute('class', 'mermaid-stroke');
++            svg.appendChild(pl);
++        }
++        for (const r of p.rows) {
++            if (!r.text.trim()) continue;
++            const t = document.createElementNS(SVG_NS, 'text');
++            t.setAttribute('x', TEXT.left);
++            t.setAttribute('y', r.baseline);
++            t.setAttribute('class', 'mermaid-typed');
++            t.style.fontFamily = `"${TEXT.font}"`;
++            t.style.fontSize = TEXT.size + 'px';
++            t.style.whiteSpace = 'pre';
++            t.textContent = r.text;
++            svg.appendChild(t);
++        }
++        box.appendChild(svg);
++    }
++
++    async function refresh() {
++        if (job) return;
++        const source = dialog().querySelector('#mermaidSource').value;
++        const seq = ++refreshSeq;
++        setStatus('Rendering…');
++        try {
++            const p = await makePlan(source);
++            if (seq !== refreshSeq) return; // a newer refresh started meanwhile
++            plan = p;
++            showPreview(p);
++            showWarnings(p.warnings);
++            setStatus(p.tall ? 'Taller than the screen: the tablet scrolls while it draws, part by part.' : '');
++        } catch (e) {
++            if (seq !== refreshSeq) return;
++            plan = null;
++            showPreview(null);
++            showWarnings([]);
++            setStatus(e.message || String(e), true);
++        }
++        updateButtons();
++    }
++
++    function openDialog() {
++        if (typeof canDraw !== 'undefined' && !canDraw) {
++            showMessage('Only the owner can draw on the tablet', MessageDuration.QUICK);
++            return;
++        }
++        const d = dialog();
++        d.classList.add('visible');
++        updateButtons();
++        d.querySelector('#mermaidSource').focus();
++        refresh();
++    }
++
++    function closeDialog() {
++        if (job) return; // stop the job first
++        dialog().classList.remove('visible');
++    }
++
++    document.getElementById('mermaidButton').addEventListener('click', openDialog);
++})();
+--- a/client/style.css
++++ b/client/style.css
+@@ -2130,3 +2130,132 @@ canvas.hidden {
+     cursor: crosshair;
+     touch-action: none;
+ }
++
++/* Mermaid import: redraw a diagram on the tablet */
++.mermaid-content {
++    width: min(1100px, 92vw);
++    max-width: none;
++    max-height: 92vh;
++    padding: 28px;
++    box-sizing: border-box;
++}
++.mermaid-content h2 {
++    margin-bottom: 8px;
++}
++.mermaid-hint {
++    margin: 0 0 16px 0;
++    color: var(--text-secondary);
++    font-size: 14px;
++    line-height: 1.5;
++}
++.mermaid-body {
++    display: grid;
++    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
++    gap: 16px;
++    height: 58vh;
++}
++#mermaidSource {
++    width: 100%;
++    height: 100%;
++    box-sizing: border-box;
++    resize: none;
++    padding: 12px;
++    font-family: 'SF Mono', Monaco, 'Courier New', monospace;
++    font-size: 13px;
++    line-height: 1.5;
++    color: var(--text-primary);
++    background: var(--bg-surface);
++    border: 1px solid var(--glass-border-hover);
++    border-radius: var(--radius-md);
++}
++#mermaidSource:focus-visible {
++    outline: 2px solid var(--accent-color);
++    outline-offset: 1px;
++}
++.mermaid-preview {
++    display: flex;
++    align-items: center;
++    justify-content: center;
++    min-height: 0;
++    background: var(--bg-surface);
++    border-radius: var(--radius-md);
++}
++.mermaid-preview svg {
++    max-width: 100%;
++    max-height: 100%;
++}
++.mermaid-page {
++    fill: #ffffff;
++    stroke: var(--glass-border-hover);
++    stroke-width: 4;
++}
++.mermaid-stroke {
++    fill: none;
++    stroke: #211e1c;
++    stroke-width: 3;
++    stroke-linecap: round;
++    stroke-linejoin: round;
++}
++.mermaid-typed {
++    fill: var(--accent-color);
++}
++.mermaid-warnings {
++    margin: 12px 0 0 0;
++    padding-left: 20px;
++    color: var(--color-warning);
++    font-size: 13px;
++}
++.mermaid-warnings:empty {
++    display: none;
++}
++.mermaid-status {
++    min-height: 20px;
++    margin-top: 12px;
++    color: var(--text-secondary);
++    font-size: 14px;
++}
++.mermaid-status.error {
++    color: var(--color-error);
++}
++.mermaid-actions {
++    display: flex;
++    justify-content: flex-end;
++    gap: 8px;
++    margin-top: 12px;
++}
++.mermaid-button {
++    padding: 8px 16px;
++    font: inherit;
++    font-size: 14px;
++    color: var(--text-primary);
++    background: var(--glass-bg-hover);
++    border: 1px solid var(--glass-border-hover);
++    border-radius: var(--radius-md);
++    cursor: pointer;
++}
++.mermaid-button.mermaid-primary {
++    color: #ffffff;
++    background: var(--accent-color);
++    border-color: var(--accent-color);
++}
++.mermaid-button.mermaid-primary:hover:not(:disabled) {
++    background: var(--accent-hover);
++}
++.mermaid-button:disabled {
++    opacity: 0.5;
++    cursor: default;
++}
++/* Off screen but rendered: the diagram is measured here. */
++.mermaid-measure {
++    position: absolute;
++    left: -100000px;
++    top: 0;
++    visibility: visible;
++    pointer-events: none;
++}
++@media (max-width: 760px) {
++    .mermaid-body {
++        grid-template-columns: 1fr;
++        grid-template-rows: 1fr 1fr;
++    }
++}
+--- a/client/uiInteractions.js
++++ b/client/uiInteractions.js
+@@ -989,6 +989,8 @@ function applyAccess(state) {
+         canDraw = state.canDraw;
+         const draw = document.getElementById('drawToggle');
+         if (draw) draw.parentElement.style.display = canDraw ? '' : 'none';
++        const mermaidItem = document.getElementById('mermaidMenuItem');
++        if (mermaidItem) mermaidItem.style.display = canDraw ? '' : 'none';
+         if (!canDraw && drawMode) {
+             setDrawMode(false);
+         }

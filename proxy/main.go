@@ -48,6 +48,7 @@ type server struct {
 	sw       *sleepWatcher
 	vs       *viewerSignal
 	pen      *penWriter // nil = remote pen disabled
+	draw     *drawer    // nil = drawing jobs disabled (no pen)
 	proxy    http.Handler
 }
 
@@ -62,6 +63,8 @@ func main() {
 	sleepWatch := flag.Bool("sleep-watch", true, "follow the display state in the xochitl journal and block streaming while the tablet sleeps")
 	penDevice := flag.String("pen-device", "/dev/input/event2", "pen input device for remote drawing from the browser (\"\" = disabled)")
 	notifyLight := flag.String("notify-light", "/sys/class/backlight/rm_frontlight", "front light used to signal viewers by blinking (\"\" = disabled)")
+	keyboardDevice := flag.String("keyboard-device", "/dev/uinput", "uinput device for typing text with xochitl's text tool from the browser (\"\" = disabled)")
+	xochitlBin := flag.String("xochitl-bin", "/usr/bin/xochitl", "xochitl binary, which holds the font of typed text")
 	flag.Parse()
 
 	if *password == "" {
@@ -107,6 +110,11 @@ func main() {
 	s := &server{password: *password, store: store, urls: urls, sw: sw, vs: vs, proxy: proxy}
 	if *penDevice != "" {
 		s.pen = newPenWriter(*penDevice)
+		var kb *virtualKeyboard
+		if *keyboardDevice != "" {
+			kb = newVirtualKeyboard(*keyboardDevice)
+		}
+		s.draw = newDrawer(s.pen, kb, sw, *xochitlBin)
 	}
 
 	srv := &http.Server{
@@ -137,6 +145,11 @@ func (s *server) handler() http.Handler {
 	mux.Handle("/state", s.requireAuth(handleState(s.sw, s.vs, s.pen != nil)))
 	if s.pen != nil {
 		mux.Handle("/pen", s.requireRole(roleOwner, handlePen(s.pen, s.sw)))
+	}
+	if s.draw != nil {
+		mux.Handle("GET /draw/info", s.requireRole(roleOwner, http.HandlerFunc(s.draw.info)))
+		mux.Handle("GET /draw/font", s.requireRole(roleOwner, http.HandlerFunc(s.draw.textFont)))
+		mux.Handle("POST /draw", s.requireRole(roleOwner, http.HandlerFunc(s.draw.run)))
 	}
 	mux.Handle("/url", s.requireAuth(handleURL(s.urls)))
 	mux.Handle("/url/qr.png", s.requireAuth(handleURLQR(s.urls)))

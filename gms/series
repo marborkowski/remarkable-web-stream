@@ -5,3 +5,4 @@ client_orientation.patch
 stream_idle_refresh.patch
 client_pen.patch
 client_roles.patch
+client_mermaid.patch

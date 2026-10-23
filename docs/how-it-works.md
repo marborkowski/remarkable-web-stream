@@ -19,6 +19,9 @@ This document describes the moving parts in more detail than the [README](../REA
 | `/healthz` | — | Returns `ok`. |
 | `/state` | ✔ | JSON `{"awake", "since", "orientation", "version", "viewers", "role", "canDraw"}`. With `?wait=<version>` it long-polls for up to 25 s until the state changes. |
 | `/pen` | owner | WebSocket for remote drawing (same-origin only). |
+| `/draw/info` | owner | JSON `{"chars", "keyboard"}`: the characters the virtual keyboard can type, and whether typing is enabled. |
+| `/draw/font` | owner | The font of typed text (reMarkable Sans Regular), read from the xochitl binary. |
+| `POST /draw` | owner | Drawing job `{"text", "pagesUp", "strokes"}` for the Mermaid import: type, scroll, draw. Streams its progress as JSON lines (same-origin only). |
 | `/url`, `/url/qr.png` | ✔ | Current public URL and its QR code. `/url?format=txt` returns plain text. |
 | everything else | ✔ | Proxied to goMarkableStream. `/stream`, `/screenshot`, `/events`, `/gestures` and `/raw` return **503** while the tablet sleeps. |
 
@@ -84,6 +87,34 @@ The proxy injects them as evdev events (`BTN_TOOL_PEN`, `BTN_TOUCH`, `ABS_X/Y`, 
 - You can disable it with `-pen-device=`.
 - Diagnostics: [`tools/pentool`](../tools/pentool/main.go) has `info` (axis ranges), `record` (dump real pen events) and `line` (inject a test stroke). Build it with `GOOS=linux GOARCH=arm64 go build` and copy it to the tablet.
 
+## Mermaid diagrams
+
+The **Mermaid** button (`client_mermaid.patch`, `proxy/draw.go`, `proxy/keyboard.go`) redraws a [Mermaid](https://mermaid.js.org) diagram on the tablet, with the labels as real typed text.
+
+**Typed text on the tablet.** xochitl's text is one flowing document per page (a "root text"): paragraphs from the top of the page in a column about 1146 px wide, starting at x = 242 px, in reMarkable Sans. Body text is 32 px with 45.7 px between the lines of a paragraph (Shift+Enter) and 69.5 px between paragraphs. Text cannot be placed anywhere, so labels go on the lines of one paragraph, moved right with spaces (7.55 px each). These values are measured on a Paper Pro in portrait at 100 % zoom; they are the `TEXT` constants in `client/mermaid.js`.
+
+**Virtual keyboard.** xochitl picks up keyboards through udev, the way it picks up the Type Folio. For a typing job the proxy creates one with `/dev/uinput` and waits 1.5 s for xochitl to open it. It presses Right and waits half a second, because the first key switches xochitl to text mode and the keys right after it are lost. xochitl has no key for the end of the text (Ctrl+End does nothing), so the proxy selects all (Ctrl+A) and collapses the selection to its end (Right). Then Enter and Ctrl+4 start a new *Body text* paragraph (an empty page starts with a Title, and a new paragraph keeps the style of the one before). Then it types and unplugs the keyboard, which takes xochitl out of text mode. Keys are mapped for the US Type Folio layout that xochitl uses without a Type Folio: it has no `[ ] { }`, and ``´ ` ^ ¨ ~`` are dead keys, which compose `ć ń ó ś ź é ä â ñ` and the like. `/draw/info` lists what it can type; the browser replaces the rest (`ą` → `a`, `[` → `(`).
+
+xochitl lays text out more slowly than keys arrive, the more slowly the longer the text: after typing a long diagram quickly it kept using one to two CPU cores for another 15 s. Meanwhile the kernel keeps only 64 input events (about 16 keys) for it and drops the rest, and xochitl ignores pen strokes. So the proxy types in batches of 5 keys, each once xochitl's CPU time shows it is idle again (`/proc/<pid>/stat`), pauses around dead keys (sent too fast, a composed letter can land before the letters typed just ahead of it), and before drawing waits until xochitl is idle. That is about 30 keys per second.
+
+**Layout in the browser.**
+1. Mermaid renders the diagram as SVG with `htmlLabels: false`, in reMarkable Sans at 32 px (from `/draw/font`), so its boxes are sized for the text as the tablet will set it.
+2. The labels (their text and baseline) and every visible outline are read from the SVG: paths, rectangles, polygons, circles, markers such as arrowheads, dashes. Lines are cut where they would run through a label, as Mermaid hides them behind a label background.
+3. Labels whose baselines are within 12 px share a text line. Rows of labels are mapped to consecutive text lines, and the whole diagram is stretched vertically, piecewise linearly, so that every row lands on its line: the boxes and arrows follow their labels. Rows are never squeezed by more than 15 %, which would push lines into the text.
+4. The labels are centred in the text column. They must fit one line of text, so a diagram that is too wide is rendered again with tighter spacing and narrower labels (`COMPACT`), and a left-to-right flowchart is turned top to bottom. Strokes stay clear of the toolbar, of the close button, of the paragraph menu xochitl shows left of the text, and of the page edges. The height is not limited; empty lines at the end of the text make sure the bottom of the diagram can be scrolled into view.
+
+**The job.** The browser sends the text (`POST /draw`). Typing scrolls the page with the cursor, so it ends with the last line of the text on the screen. The browser then waits for the screen to stop changing, takes a screenshot (`/screenshot`) and looks for the text it expects. It matches the dark pixels, without the lone dots of a grid or dotted page template, with a coarse search on 8×8 blocks, then a fine one around the best few candidates; the score is the text explained (hits minus misses). Then it draws, with the pen, the part of the diagram that is on the screen (`POST /draw`). If the text is not found, nothing more is drawn. Text goes first because xochitl anchors strokes to the text near them: typing above a stroke pushes it down.
+
+A diagram taller than the screen is drawn in parts, from the bottom up. Between parts the proxy presses Page Up (`pagesUp`), which in text mode scrolls the page by 80 % of the screen, so consecutive parts overlap. After each scroll a new screenshot tells where the page is. Two things can match more than once: the same diagram drawn earlier on the page (the newest is the lowest of equally good matches), and labels that repeat, such as the messages of a sequence diagram, which match themselves a few lines off. After Page Up the match that agrees with the 80 % step wins; at the top of the page, which scrolls less, the first labels are on the screen and the best match is right.
+
+**Drawing like a hand.** xochitl smooths pen input along the stroke, so injected strokes need some care:
+- Every stroke starts with the pen hovering towards the first point for 60 px and touching down while moving (`h` before `d` in `penWriter.apply`). A pen that touches down at rest draws a wiggle at the start of each stroke.
+- Strokes are cut at sharp corners (more than 30°). A pen turning a corner overshoots it by about 5 px, however slowly it goes, so a rectangle is four strokes that overlap by 1.5 px.
+- Samples are 3 px apart, one every 4 ms, which is about 8 cm/s.
+- xochitl maps the pen onto the 1620×2160 panel of the Paper Pro, not onto the 1632×2154 framebuffer: screen x = 1620/1632 · pen x + 3.2 and screen y = 2160/2154 · pen y − 0.7 (`PEN_MAP` in `client/mermaid.js`). Without that correction the boxes land up to 7 px off.
+
+Small dark shapes such as arrowheads are drawn as outlines; very short strokes come out as blots. Mermaid sizes arrowheads for 16 px text, so they are drawn 1.75 times larger.
+
 ## "Someone is watching" signal
 
 xochitl has no local notification API (its notification bar is fed only by the reMarkable cloud), and e-ink will not refresh pixels drawn from outside. The proxy therefore signals viewers with the **front light**, and always restores your brightness level:
@@ -115,13 +146,14 @@ The patches live in [`gms/`](../gms/) and are applied by [`gms/build-gms.sh`](..
 
 | Patch | Changes |
 | --- | --- |
-| `pointer_arm64.patch` | **Paper Pro framebuffer detection.** Upstream finds the framebuffer by walking from the last `/dev/dri/card0` mapping. That works only after a cold boot; after a `xochitl` restart it got stuck in an endless loop. The patch scans xochitl's anonymous mappings for an mmapped glibc malloc chunk of frame size whose content looks like an opaque BGRA image. The old method remains as a fallback, now guarded against looping. |
+| `pointer_arm64.patch` | **Paper Pro framebuffer detection.** Upstream finds the framebuffer by walking from the last `/dev/dri/card0` mapping. That works only after a cold boot; after a `xochitl` restart it got stuck in an endless loop. The patch scans xochitl's anonymous mappings for an mmapped glibc malloc chunk of frame size, starting on a page boundary, whose content looks like an opaque BGRA image (other large buffers, such as the page images xochitl keeps after drawing long pages, can hold data that looks like a chunk header elsewhere). The old method remains as a fallback, now guarded against looping. |
 | `stream_preempt.patch` | Per-connection delta encoder; up to 3 concurrent viewers; the newest viewer preempts instead of getting a 429. |
 | `client_sleep.patch` | "The tablet is asleep" / "Cannot reach the tablet" overlay, handling of the proxy's 503, and endless reconnect with backoff capped at 10 s. |
 | `client_orientation.patch` | **Auto-rotate** button and shortcut, plus the `/state` long-poll. |
 | `stream_idle_refresh.patch` | Keeps refreshing at 0.5 s without pen input, and applies a pending rotation with the first changed frame. |
 | `client_pen.patch` | **Draw** button and shortcut, pointer to native coordinate mapping, and the `/pen` WebSocket client. |
 | `client_roles.patch` | Owner/guest roles from `/state`: hides **Draw** for guests, adds the **Invite** button for the owner, reloads the page when the session ends. |
+| `client_mermaid.patch` | **Mermaid** button and dialog (`client/mermaid.js`): renders the diagram, lays its labels out on the lines of xochitl's text, runs the drawing job. `build-gms.sh` adds the Mermaid library (pinned version and SHA-256) to `client/lib/`. |
 
 To update the patches for a new upstream version, see [CONTRIBUTING.md](../CONTRIBUTING.md#updating-the-gomarkablestream-patches).
 
