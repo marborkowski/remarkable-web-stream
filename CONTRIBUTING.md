@@ -63,3 +63,7 @@ git diff <parent-commit> <patch-commit> > /path/to/repo/gms/<name>.patch
 ```
 
 Then run `make gms` (delete `dist/gms-src-*` first: the build reuses an already patched tree), and run the upstream tests with the patches applied: `cd dist/gms-src-v1.4.0 && go test ./internal/stream/`.
+
+### Updating Mermaid
+
+`client_mermaid.patch` uses the Mermaid library that `gms/build-gms.sh` downloads into `client/lib/`. To move to another version, change `MERMAID_VERSION` and the two SHA-256 sums in `MERMAID_FILES` (of `dist/mermaid.min.js` and `LICENSE` in the npm package), rebuild as above, and check a few diagram types in the **Mermaid** dialog: the import reads Mermaid's SVG (labels as `<text>` with `htmlLabels: false`, arrowheads as `<marker>`), so a new version can change what it finds.
