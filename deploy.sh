@@ -19,7 +19,7 @@ DIST=$ROOT/dist
 REMOTE_DIR=/home/root/rmshare
 mkdir -p "$DIST"
 
-# The proxy refuses to start without a viewer password, so fail early.
+# The proxy refuses to start without an owner password, so fail early.
 if ! grep -Eq '^RMSHARE_PASSWORD=.{8,}' "$ROOT/tunnel.env" 2>/dev/null; then
   echo "error: set RMSHARE_PASSWORD (at least 8 characters) in $ROOT/tunnel.env" >&2
   echo "       e.g.: cp tunnel.env.example tunnel.env && \$EDITOR tunnel.env" >&2

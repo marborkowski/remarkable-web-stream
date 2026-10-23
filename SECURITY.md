@@ -17,7 +17,7 @@ Reports are handled on a best-effort basis. There is no guaranteed response time
 ## Scope
 
 In scope:
-- the `rmshare` proxy (`proxy/`): authentication, session handling, the remote pen WebSocket, and anything reachable through the proxy;
+- the `rmshare` proxy (`proxy/`): authentication (password and invite links), roles, session handling and the state file, the remote pen WebSocket, and anything reachable through the proxy;
 - the deployment and device scripts (`deploy.sh`, `device/`);
 - the goMarkableStream patches in `gms/`, as far as they introduce the problem.
 

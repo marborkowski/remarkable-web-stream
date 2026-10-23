@@ -1,8 +1,8 @@
 # reMarkable Live
 
-**Watch your reMarkable screen live in any web browser, from anywhere, behind a password. Everything runs on the tablet itself.**
+**Watch your reMarkable screen live in any web browser, from anywhere, behind a password or an invite link. Everything runs on the tablet itself.**
 
-Open a URL on any computer or phone, type the password, and see what you write and draw on the tablet in real time. Viewers can even draw back onto the tablet. You need a computer only to deploy it. After that, the tablet runs the whole thing as three systemd services.
+Open a URL on any computer or phone, sign in with the password, and see what you write and draw on the tablet in real time. You can even draw back onto the tablet from the browser. To let other people watch, hand them an invite link that expires or that you can revoke; they only watch. You need a computer only to deploy it. After that, the tablet runs the whole thing as three systemd services.
 
 > [!WARNING]
 > **This is an experimental hobby project.** It modifies a device you rely on, runs as `root`, and makes your tablet's screen reachable from the public internet. Read [Security considerations](#security-considerations) before you use it, and use it at your own risk. It is provided **as is, without any warranty**. The author is not liable for any damage, data loss or security incident caused by using it (see [Disclaimer](#disclaimer) and [LICENSE](LICENSE)).
@@ -51,7 +51,7 @@ Open a URL on any computer or phone, type the password, and see what you write a
 browser ──HTTPS──▶ tunnel (Tailscale Funnel / Cloudflare) ──▶ tunnel client on the reMarkable
                                                                    │ http://127.0.0.1:8080
                                                                    ▼
-                                     rmshare (Go proxy: login form, session cookie,
+                                     rmshare (Go proxy: login form, invite links, sessions and roles,
                                               sleep/orientation watcher, remote pen,
                                               viewer signal, URL document)
                                                                    │ http://127.0.0.1:2011
@@ -64,7 +64,7 @@ browser ──HTTPS──▶ tunnel (Tailscale Funnel / Cloudflare) ──▶ tu
 | Service | Binary | Role |
 | --- | --- | --- |
 | `rmshare-stream` | `gomarkablestream` | Upstream [goMarkableStream](https://github.com/owulveryck/goMarkableStream) built from source with [our patches](gms/). Bound to `127.0.0.1` only, with its own authentication disabled, so it can be reached only through the proxy. |
-| `rmshare-proxy` | `rmshare` ([`proxy/`](proxy/)) | Password gate and reverse proxy on `:8080`, plus all the extras: sleep and orientation detection from the xochitl journal, the remote pen WebSocket, the front-light signal and the URL document. |
+| `rmshare-proxy` | `rmshare` ([`proxy/`](proxy/)) | Login (password or invite link) and reverse proxy on `:8080`, plus all the extras: sleep and orientation detection from the xochitl journal, the remote pen WebSocket, the front-light signal and the URL document. |
 | `rmshare-tunnel` | `cloudflared` or `tailscaled` | Publishes the proxy to the internet ([`device/run-tunnel.sh`](device/run-tunnel.sh)). |
 
 For the details of each feature and of each patch, see [docs/how-it-works.md](docs/how-it-works.md).
@@ -194,7 +194,7 @@ sh /home/root/rmshare/uninstall.sh            # stop and remove the services
 rm -rf /home/root/rmshare                     # ...and delete all files
 ```
 
-The viewer also works locally without any tunnel, still behind the password: `http://10.11.99.1:8080` (USB) or `http://<tablet-ip>:8080` (Wi-Fi).
+The viewer also works locally without any tunnel, still behind the login: `http://10.11.99.1:8080` (USB) or `http://<tablet-ip>:8080` (Wi-Fi).
 
 **Starting on boot.** On the Paper Pro, `/etc` is an overlay whose writable layer lives in RAM, so anything written to `/etc/systemd/system` disappears on reboot. `install.sh` therefore also writes the three unit files to the root partition itself. It remounts `/` read-write just for that and switches it back to read-only afterwards. `uninstall.sh` removes them again.
 
@@ -224,7 +224,7 @@ reMarkable Live is a **personal screen-sharing tool for a handful of viewers**. 
 - **Every viewer costs the tablet resources.** Frames are read from xochitl's memory and delta-encoded **separately for each connection**, on the tablet's CPU, right next to the UI you are writing in. More viewers mean more CPU load, a less responsive tablet and faster battery drain. Even with a single viewer, idle refresh alone takes about 15–20 % of one CPU core.
 - **Bandwidth comes from the tablet's Wi-Fi.** Each viewer's stream is uploaded separately over the tablet's wireless connection, so total traffic grows with the number of viewers. The tunnel provider only relays it.
 - **Availability depends on the tablet.** When the tablet sleeps, loses Wi-Fi, runs out of battery or restarts xochitl, every viewer loses the picture. There is no recording, buffering or replay.
-- **No per-viewer access control.** Everyone shares one password, and anyone who has it can also draw on the tablet (see [Security considerations](#security-considerations)).
+- **Coarse access control.** There are two roles only: the owner (password: watch, draw, invite) and guests (invite link: watch). There are no user accounts. Several people can join through the same link, and the owner tells them apart only by the IP address and the time they joined (see [Security considerations](#security-considerations)).
 
 If you need to present to a larger audience, share your screen to a single viewer (for example your own computer) and broadcast that computer's screen with a video-conferencing or streaming tool.
 

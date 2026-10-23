@@ -63,7 +63,7 @@ This gives you a stable URL on your own domain.
 
 Alternatively, put your own `config.yml` and credentials file (from `cloudflared tunnel create`) into a `cloudflared/` directory in the project root. `run-tunnel.sh` uses them when no token is set.
 
-**Tip:** you can put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) (for example, e-mail one-time PINs) in front of the hostname. You then have two layers: Cloudflare Access and the proxy password.
+**Tip:** you can put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) (for example, e-mail one-time PINs) in front of the hostname. You then have two layers: Cloudflare Access and the proxy's own login (password or invite link).
 
 ## Comparison with alternatives
 
